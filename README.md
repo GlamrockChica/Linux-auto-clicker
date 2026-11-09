@@ -10,7 +10,9 @@ and can record and replay what you do.
   several spots in turn
 - **Keyboard clicker:** presses a key or key combo (like Ctrl+C) over and over, or holds it
 - **Record and replay:** record your mouse and keyboard, replay it once, a set number of
-  times or on a loop, and save recordings as profiles with their own hotkey
+  times or on a loop, and save recordings as profiles with their own hotkey. Mouse
+  movement replays properly in games that lock the mouse (like first-person Roblox),
+  so the camera turns the same way it did when you recorded
 - **Stops by itself** after a number of clicks or a set time, or when you move the mouse
 - **Mini mode:** a small rounded panel that stays on top of other windows
 - **Badge:** a small card in the corner of the screen showing what's running
@@ -31,11 +33,11 @@ sudo apt install python3-venv python3-tk git
 ```
 
 ```bash
-git clone https://github.com/YOURNAME/auto-clicker.git
+git clone https://github.com/GlamrockChica/Linux-auto-clicker.git
 ```
 
 ```bash
-cd auto-clicker && ./install.sh
+cd Linux-auto-clicker && ./install.sh
 ```
 
 (Or download the zip from GitHub, unzip it, open a terminal in the folder and run
@@ -51,7 +53,7 @@ Get the new version, then run the installer again. It closes the app, rebuilds i
 starts it again. Your settings and profiles are kept.
 
 ```bash
-cd auto-clicker && git pull && ./install.sh
+cd Linux-auto-clicker && git pull && ./install.sh
 ```
 
 ## Keys

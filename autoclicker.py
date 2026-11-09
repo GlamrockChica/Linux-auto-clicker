@@ -331,8 +331,8 @@ def clean_recording(recording):
         nums = action[2:] if kind in ("move", "scroll") else action[3:]
         if not all(isinstance(n, (int, float)) for n in nums):
             continue
-        if kind == "move" and len(action) == 4:
-            good.append(action)
+        if kind == "move" and len(action) in (4, 6):
+            good.append([*action[:2], *(int(n) for n in action[2:])])
         elif kind == "scroll" and len(action) == 6:
             good.append(action)
         elif (kind in ("press", "release") and len(action) == 5
@@ -482,7 +482,9 @@ def list_profiles() -> list:
 #   {profile:"hellohello"}
 #   {[0.0],kpress:"h"}          <- wait 0 seconds, then press H
 #   {[0.135],krelease:"h"}      <- wait 0.135 seconds, then let go of H
-#   {[0.015],move:"812,440"}    <- move the mouse to x 812, y 440
+#   {[0.015],move:"812,440,6,-3"}  <- the mouse moved 6 right and 3 up, ending at
+#                                     x 812, y 440 (games turn the camera with the 6,-3;
+#                                     older files have just "812,440")
 #   {[0.03],press:"left,812,440"}   (release:"left,812,440" lets go)
 #   {[0.1],scroll:"0,-2,812,440"}   (sideways, up/down, then where)
 # The number in [ ] is the delay: seconds since the previous input.
@@ -518,8 +520,8 @@ def profile_lines(name: str, recording, hotkey=None) -> list:
             value = key_to_text(action[2])
         elif kind in ("press", "release"):
             value = f"{action[2][6:]},{action[3]},{action[4]}"  # button,x,y
-        elif kind == "move":
-            value = f"{action[2]},{action[3]}"
+        elif kind == "move":  # where it ended up (and how far it moved, if known)
+            value = ",".join(str(n) for n in action[2:6])
         else:  # scroll
             value = ",".join(str(n) for n in action[2:6])
         lines.append("{[" + f"{delay:g}" + "]," + kind + ":" + json.dumps(value) + "}")
@@ -543,8 +545,9 @@ def parse_profile(text: str):
                 button, x, y = value.split(",")
                 recording.append([t, kind, "mouse:" + button.strip(), int(x), int(y)])
             elif kind == "move":
-                x, y = value.split(",")
-                recording.append([t, kind, int(x), int(y)])
+                numbers = [int(n) for n in value.split(",")]
+                if len(numbers) in (2, 4):
+                    recording.append([t, kind, *numbers])
             elif kind == "scroll":
                 recording.append([t, kind, *(int(n) for n in value.split(","))])
         except (ValueError, TypeError, AttributeError):
@@ -2640,8 +2643,9 @@ class RecordingEditor(tk.Toplevel):
                             selectbackground=p["select"], selectforeground=p["select_fg"],
                             padx=8, pady=6, font=("DejaVu Sans Mono", 10))
         self.text.grid(row=1, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
-        scroll.grid(row=1, column=1, sticky="ns")
+        scroll = RoundedScrollbar(body, command=self.text.yview)
+        scroll.set_palette(p)
+        scroll.grid(row=1, column=1, sticky="ns", padx=(4, 0))
         self.text.configure(yscrollcommand=scroll.set)
         lines = profile_lines("", recording)[1:] if recording else []
         self.text.insert("1.0", "\n".join(lines))
@@ -2676,6 +2680,134 @@ class RecordingEditor(tk.Toplevel):
         self.on_save(recording, skipped)
 
 
+def render_cap(image, w, h, top, color, bg_color, samples=4):
+    """Draw one rounded end of a scroll bar thumb (a half circle `w` wide, `h` tall) into
+    a PhotoImage, with smooth edges. `top` picks the upper or the lower end."""
+    bg = [int(bg_color[i:i + 2], 16) for i in (1, 3, 5)]
+    fg = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+    r = w / 2
+    cy = h if top else 0  # the circle's centre is where the cap meets the straight part
+    rows = []
+    for y in range(h):
+        row = []
+        for x in range(w):
+            hits = 0
+            for sy in range(samples):
+                for sx in range(samples):
+                    px = x + (sx + 0.5) / samples
+                    py = y + (sy + 0.5) / samples
+                    if (px - r) ** 2 + (py - cy) ** 2 <= r * r:
+                        hits += 1
+            a = hits / samples ** 2
+            row.append("#%02x%02x%02x" % tuple(round(b + (f - b) * a) for b, f in zip(bg, fg)))
+        rows.append("{" + " ".join(row) + "}")
+    image.put(" ".join(rows))
+
+
+class RoundedScrollbar(tk.Canvas):
+    """A thin scroll bar with a rounded (pill-shaped) handle. It gets a little wider and
+    darker while the mouse is over it. Works like ttk.Scrollbar: give it `command`
+    (e.g. a canvas's yview) and set the scrolled widget's yscrollcommand to its `set`."""
+
+    WIDTH = 10        # room it takes up
+    THIN, WIDE = 6, 8  # handle width normally / with the mouse over it
+    MIN_LENGTH = 28   # the handle never gets shorter than this
+    GAP = 1           # space above and below the handle
+
+    def __init__(self, parent, command):
+        super().__init__(parent, width=self.WIDTH, highlightthickness=0, bd=0)
+        self.command = command
+        self.palette = None
+        self.first, self.last = 0.0, 1.0
+        self.hover = False
+        self.drag_offset = None  # where on the handle it was grabbed, while dragging
+        self.caps = {}  # (width, colour, bg) -> (top image, bottom image)
+        self.bind("<Configure>", lambda e: self.redraw())
+        self.bind("<Enter>", lambda e: self.set_hover(True))
+        self.bind("<Leave>", lambda e: self.set_hover(False))
+        self.bind("<ButtonPress-1>", self.press)
+        self.bind("<B1-Motion>", self.drag)
+        self.bind("<ButtonRelease-1>", self.release)
+
+    def set(self, first, last):
+        self.first, self.last = float(first), float(last)
+        self.redraw()
+
+    def set_palette(self, palette):
+        self.palette = palette
+        self.configure(bg=palette["bg"])
+        self.caps.clear()
+        self.redraw()
+
+    def set_hover(self, on):
+        self.hover = on
+        self.redraw()
+
+    def handle(self):
+        """Top and bottom of the handle, in pixels."""
+        h = self.winfo_height() - 2 * self.GAP
+        span = max(0.0, min(1.0, self.last - self.first))
+        length = min(h, max(self.MIN_LENGTH, span * h))
+        room = h - length
+        top = room * self.first / (1 - span) if span < 1 else 0
+        top = self.GAP + max(0, min(room, top))
+        return top, top + length
+
+    def press(self, event):
+        top, bottom = self.handle()
+        if top <= event.y <= bottom:
+            self.drag_offset = event.y - top
+        else:  # clicked above or below the handle: go one page that way
+            self.command("scroll", -1 if event.y < top else 1, "pages")
+        self.redraw()
+
+    def drag(self, event):
+        if self.drag_offset is None:
+            return
+        top, bottom = self.handle()
+        room = self.winfo_height() - 2 * self.GAP - (bottom - top)
+        if room <= 0:
+            return
+        span = self.last - self.first
+        place = (event.y - self.drag_offset - self.GAP) / room
+        self.command("moveto", max(0.0, min(1.0, place)) * (1 - span))
+
+    def release(self, event):
+        self.drag_offset = None
+        x, y = event.x, event.y
+        self.hover = 0 <= x < self.winfo_width() and 0 <= y < self.winfo_height()
+        self.redraw()
+
+    def cap_images(self, width, color, bg):
+        key = (width, color, bg)
+        if key not in self.caps:
+            h = width // 2
+            images = []
+            for top in (True, False):
+                image = tk.PhotoImage(width=width, height=h)
+                render_cap(image, width, h, top, color, bg)
+                images.append(image)
+            self.caps[key] = tuple(images)
+        return self.caps[key]
+
+    def redraw(self):
+        self.delete("all")
+        if not self.palette or self.winfo_height() < 2 * self.MIN_LENGTH:
+            return
+        p = self.palette
+        active = self.hover or self.drag_offset is not None
+        width = self.WIDE if active else self.THIN
+        color = p["muted"] if active else p["border"]
+        top, bottom = round(self.handle()[0]), round(self.handle()[1])
+        x = (self.winfo_width() - width) // 2
+        cap = width // 2
+        top_cap, bottom_cap = self.cap_images(width, color, p["bg"])
+        self.create_image(x, top, image=top_cap, anchor="nw")
+        self.create_rectangle(x, top + cap, x + width, bottom - cap,
+                              fill=color, outline="")
+        self.create_image(x, bottom - cap, image=bottom_cap, anchor="nw")
+
+
 class ScrollArea(ttk.Frame):
     """A page area that scrolls when its contents are taller than the window. Put things in
     `self.inner`. The thin scroll bar only shows when it's needed; the mouse wheel works
@@ -2684,13 +2816,12 @@ class ScrollArea(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
         self.canvas = tk.Canvas(self, highlightthickness=0, bd=0, yscrollincrement=20)
-        self.bar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview,
-                                 style="Thin.Vertical.TScrollbar")
+        self.bar = RoundedScrollbar(self, command=self.canvas.yview)
         self.inner = ttk.Frame(self.canvas)
         self.window = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
         self.canvas.configure(yscrollcommand=self.bar.set)
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.bar.grid(row=0, column=1, sticky="ns", padx=(8, 0))
+        self.bar.grid(row=0, column=1, sticky="ns", padx=(6, 0))
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
         self.palette = None
@@ -2752,6 +2883,7 @@ class ScrollArea(ttk.Frame):
     def set_palette(self, palette):
         self.palette = palette
         self.canvas.configure(bg=palette["bg"])
+        self.bar.set_palette(palette)
 
 
 class SidebarHandle(tk.Canvas):
@@ -2825,6 +2957,152 @@ class SidebarHandle(tk.Canvas):
             line(0, 1, self.palette["border"])
 
 
+class Pointer:
+    """Moves the mouse pointer for replays and set click spots, in a way games understand.
+
+    Games that lock the mouse (first-person cameras, like Roblox) turn the camera by how
+    far the mouse *moves*, and ignore where the pointer is. So move_by() sends real mouse
+    movement, and place() puts the pointer on a spot without sending any movement (if it
+    did, the game would see the jump as one huge flick and spin the camera)."""
+
+    def __init__(self):
+        self.display = None
+        self.root = None
+        self.broken = False  # no X connection: fall back to pynput
+        self.fallback = None
+
+    def connect(self):
+        if self.display is None and not self.broken:
+            try:
+                from Xlib import display as xdisplay
+                from Xlib.ext import xtest  # noqa: F401  (makes sure it's there)
+                self.display = xdisplay.Display()
+                self.root = self.display.screen().root
+            except Exception as err:
+                print(f"Moving the mouse the simple way ({err})")
+                self.broken = True
+                self.fallback = mouse.Controller()
+        return self.display
+
+    def move_by(self, dx, dy):
+        if not dx and not dy:
+            return
+        if self.connect() is None:
+            self.fallback.move(dx, dy)
+            return
+        from Xlib import X
+        from Xlib.ext import xtest
+        xtest.fake_input(self.display, X.MotionNotify, detail=1, x=int(dx), y=int(dy))
+        self.display.flush()
+
+    def place(self, x, y):
+        if self.connect() is None:
+            self.fallback.position = (x, y)
+            return
+        self.root.warp_pointer(int(x), int(y))
+        self.display.flush()
+
+
+class RawMotion:
+    """Hears how far the mouse itself moves (X11 "raw motion"), not just where the pointer
+    is. When a game locks the mouse it keeps the pointer still, or it gets stuck at the edge
+    of the screen, so its position stops changing; the raw movement still comes through.
+    Our own fake movement (from the "XTEST" device) is ignored.
+
+    on_move(dx, dy) and on_idle() are called on this listener's own thread."""
+
+    def __init__(self, on_move, on_idle):
+        self.on_move = on_move
+        self.on_idle = on_idle
+        self.display = None
+        self.devices = {}  # device id -> True if its movement should be recorded
+        self.running = False
+
+    def start(self):
+        """Start listening. Returns False if this computer can't do it."""
+        try:
+            from Xlib import display as xdisplay
+            from Xlib.ext import xinput
+            self.display = xdisplay.Display()
+            if not self.display.has_extension("XInputExtension"):
+                raise RuntimeError("no XInput extension")
+            # Say we speak XInput 2.2: from 2.1 on, raw movement keeps coming while a
+            # game has grabbed the mouse (with 2.0 the game gets it all to itself)
+            xinput.XIQueryVersion(display=self.display.display,
+                                  opcode=self.display.display.get_extension_major(xinput.extname),
+                                  major_version=2, minor_version=2)
+            self.display.screen().root.xinput_select_events(
+                [(xinput.AllMasterDevices, xinput.RawMotionMask)])
+            self.load_devices()
+            self.display.flush()
+        except Exception as err:
+            print(f"Recording mouse movement by position only ({err})")
+            self.close()
+            return False
+        self.running = True
+        threading.Thread(target=self.run, daemon=True).start()
+        return True
+
+    def stop(self):
+        self.running = False  # the thread notices within a few milliseconds
+
+    def close(self):
+        if self.display is not None:
+            try:
+                self.display.close()
+            except Exception:
+                pass
+            self.display = None
+
+    def load_devices(self):
+        from Xlib.ext import xinput
+        self.devices = {}
+        for dev in self.display.xinput_query_device(xinput.AllDevices).devices:
+            name = dev.name.decode(errors="replace") if isinstance(dev.name, bytes) else dev.name
+            axes = {c.number: c.mode for c in dev.classes if c.type == xinput.ValuatorClass}
+            # Only real mice/touchpads: not our own fake input, and not tablets or touch
+            # screens, which report where you touch rather than how far you moved
+            self.devices[dev.deviceid] = ("XTEST" not in name
+                                          and axes.get(0) == 0 and axes.get(1) == 0)
+
+    def run(self):
+        import select
+        from Xlib.ext import xinput
+        try:
+            while self.running:
+                select.select([self.display], [], [], 0.01)
+                while self.running and self.display.pending_events():
+                    event = self.display.next_event()
+                    if getattr(event, "evtype", None) == xinput.RawMotion:
+                        self.handle(event.data)
+                self.on_idle()
+        except Exception as err:
+            print(f"Stopped listening to raw mouse movement: {err}")
+        finally:
+            self.close()
+
+    def handle(self, data):
+        """Read one raw motion event: which device, and its x/y movement."""
+        import struct
+        source, mask_len = struct.unpack_from("=HH", data, 10)
+        if source not in self.devices:
+            self.load_devices()  # a mouse was plugged in
+        if not self.devices.get(source):
+            return
+        mask = int.from_bytes(data[22:22 + 4 * mask_len], "little")
+        axes = [i for i in range(32 * mask_len) if mask >> i & 1]
+        # after the mask: each axis's processed value, then each axis's raw value
+        # (8 bytes each: a whole number, then a fraction out of 2**32)
+        start = 22 + 4 * mask_len + 8 * len(axes)
+        moved = {}
+        for n, axis in enumerate(axes):
+            whole, frac = struct.unpack_from("=iI", data, start + 8 * n)
+            moved[axis] = whole + frac / 2 ** 32
+        dx, dy = moved.get(0, 0.0), moved.get(1, 0.0)
+        if dx or dy:
+            self.on_move(dx, dy)
+
+
 class AutoClicker:
     SYNTHETIC_WINDOW = 0.03  # seconds: presses this soon after our own click/press are ours
     REPEAT_WINDOW = 0.2      # seconds: the same key again this soon is a duplicate/held key
@@ -2840,6 +3118,8 @@ class AutoClicker:
 
         self.mouse = mouse.Controller()
         self.keyboard = keyboard.Controller()
+        self.pointer = Pointer()  # moves the pointer during replays (see Pointer)
+        self.replay_pos = None    # where the replay last put the pointer
         self.running = threading.Event()   # set while clicking/pressing/replaying
         self.stopped = threading.Event()   # set by stop(), wakes the worker from its wait
         self.shutdown = threading.Event()
@@ -2872,6 +3152,12 @@ class AutoClicker:
         self.recording_buf = []
         self.record_t0 = 0.0
         self.record_last_move = 0.0
+        # mouse movement waiting to be recorded (one "move" at most every MOVE_SAMPLE)
+        self.motion_lock = threading.RLock()
+        self.raw_motion = None        # RawMotion listener, while recording movement
+        self.record_pos = None        # where the pointer is
+        self.record_dx = self.record_dy = 0.0  # how far the mouse moved since the last move
+        self.record_moved = False     # something above changed since the last move
         self.record_pressed = set()   # buttons/keys pressed since recording began
         self.record_exclude = set()   # the app's own keys, never recorded
         self.record_rect = None       # the app window, to trim clicks on "Stop recording"
@@ -3049,9 +3335,6 @@ class AutoClicker:
 
         # Apply the starting colours instantly (no animation on launch)
         self.style.theme_use("clam")
-        self.style.layout("Thin.Vertical.TScrollbar", [
-            ("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
-                ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
         self.apply_palette(build_palette(saved["dark_mode"], saved["accent"]))
 
         self.hotkey.trace_add("write", lambda *_: self.refresh_button())
@@ -4237,11 +4520,6 @@ class AutoClicker:
                     troughcolor=p["field"], insertcolor=p["fg"],
                     selectbackground=p["select"], selectforeground=p["fg"])
         s.configure("TSeparator", background=p["border"])
-        s.configure("Thin.Vertical.TScrollbar", troughcolor=p["bg"], background=p["border"],
-                    bordercolor=p["bg"], lightcolor=p["border"], darkcolor=p["border"],
-                    arrowsize=8, gripcount=0)
-        s.map("Thin.Vertical.TScrollbar", background=[("active", p["muted"])],
-              lightcolor=[("active", p["muted"])], darkcolor=[("active", p["muted"])])
         s.configure("Muted.TLabel", foreground=p["muted"])
         s.configure("Caption.TLabel", foreground=p["muted"], font=self.font_caption)
         s.configure("Card.TLabel", background=p["card"], foreground=p["fg"])
@@ -4703,21 +4981,38 @@ class AutoClicker:
         self.record_from_button = from_button
         self.recording_buf = []
         self.record_pressed = set()
-        self.record_last_move = 0.0
+        with self.motion_lock:
+            self.record_last_move = 0.0
+            self.record_dx = self.record_dy = 0.0
+            self.record_moved = False
+            try:
+                x, y = self.mouse.position
+                self.record_pos = (int(x), int(y))
+            except Exception:
+                self.record_pos = None
+        if self.record_movement:
+            self.raw_motion = RawMotion(lambda dx, dy: self.note_motion(dx=dx, dy=dy),
+                                        self.flush_motion_later)
+            if not self.raw_motion.start():
+                self.raw_motion = None  # positions only, like before
         self.record_t0 = time.monotonic()
         self.recording_active = True
         self.status.config(text="Recording...")
         self.refresh_recording_info()
 
     def stop_recording(self, from_button=False):
+        self.flush_motion()
         self.recording_active = False
+        if self.raw_motion is not None:
+            self.raw_motion.stop()
+            self.raw_motion = None
         actions = list(self.recording_buf)
         self.recording_buf = []
 
         def in_window(action):
             if action[1] not in ("move", "press", "release", "scroll") or not self.record_rect:
                 return False
-            x, y = action[-2], action[-1]
+            x, y = action[{"move": 2, "press": 3, "release": 3, "scroll": 4}[action[1]]:][:2]
             rx, ry, rw, rh = self.record_rect
             return rx <= x < rx + rw and ry <= y < ry + rh
 
@@ -4776,8 +5071,48 @@ class AutoClicker:
         """Called from the listener threads while recording."""
         if not self.recording_active:
             return
-        t = round(time.monotonic() - self.record_t0, 3)
-        self.recording_buf.append([t, *action])
+        with self.motion_lock:
+            if action[0] != "move":
+                self.flush_motion()  # the movement before a click comes before the click
+            t = round(time.monotonic() - self.record_t0, 3)
+            self.recording_buf.append([t, *action])
+
+    def note_motion(self, x=None, y=None, dx=0.0, dy=0.0):
+        """The pointer moved to x, y, and/or the mouse moved dx, dy (from RawMotion).
+        Recorded as a "move" at most every MOVE_SAMPLE seconds."""
+        if not (self.recording_active and self.record_movement):
+            return
+        with self.motion_lock:
+            if x is not None:
+                self.record_pos = (int(x), int(y))
+            self.record_dx += dx
+            self.record_dy += dy
+            self.record_moved = True
+            if time.monotonic() - self.record_last_move >= self.MOVE_SAMPLE:
+                self.flush_motion()
+
+    def flush_motion_later(self):
+        """RawMotion's idle check: record movement that's been waiting long enough."""
+        if self.record_moved and time.monotonic() - self.record_last_move >= self.MOVE_SAMPLE:
+            self.flush_motion()
+
+    def flush_motion(self):
+        """Record the movement waiting since the last "move", if there is any."""
+        with self.motion_lock:
+            if not self.record_moved or self.record_pos is None:
+                return
+            self.record_moved = False
+            self.record_last_move = time.monotonic()
+            x, y = self.record_pos
+            if self.raw_motion is None:
+                self.record_event("move", x, y)
+                return
+            dx, dy = round(self.record_dx), round(self.record_dy)
+            self.record_dx -= dx  # keep the leftover fraction for next time
+            self.record_dy -= dy
+            last = next((a for a in reversed(self.recording_buf) if a[1] == "move"), None)
+            if dx or dy or last is None or last[2:4] != [x, y]:
+                self.record_event("move", x, y, dx, dy)
 
     # ---------------- Control ----------------
     def read_settings(self, recording=None, label=None):
@@ -4959,7 +5294,7 @@ class AutoClicker:
                 self.keyboard.release(key)
         else:
             if s["locations"]:  # one spot, or several clicked in turn
-                self.mouse.position = s["locations"][self.clicks % len(s["locations"])]
+                self.pointer.place(*s["locations"][self.clicks % len(s["locations"])])
             self.mouse.click(s["button"], s["count"])
 
     def press_and_hold(self, s):
@@ -4974,7 +5309,7 @@ class AutoClicker:
                     self.held.append(("keyboard", key))
             else:
                 if s["locations"]:
-                    self.mouse.position = s["locations"][0]
+                    self.pointer.place(*s["locations"][0])
                 self.mouse.press(s["button"])
                 self.held.append(("mouse", s["button"]))
 
@@ -4998,6 +5333,7 @@ class AutoClicker:
         played = 0
         while self.running.is_set():
             began = time.monotonic()
+            self.replay_pos = None
             for action in s["actions"]:
                 wait = began + action[0] - time.monotonic()
                 if wait > 0 and self.stopped.wait(wait):
@@ -5018,13 +5354,21 @@ class AutoClicker:
         kind = action[1]
         with self.hold_lock:
             if kind == "move":
-                self.mouse.position = (action[2], action[3])
+                x, y = action[2], action[3]
+                if len(action) == 6:  # how far the mouse moved: what games turn with
+                    dx, dy = action[4], action[5]
+                elif self.replay_pos is not None:  # older recordings: work it out
+                    dx, dy = x - self.replay_pos[0], y - self.replay_pos[1]
+                else:
+                    dx = dy = 0
+                self.pointer.move_by(dx, dy)
+                self.place_pointer(x, y)
             elif kind == "scroll":
-                self.mouse.position = (action[4], action[5])
+                self.place_pointer(action[4], action[5])
                 self.mouse.scroll(action[2], action[3])
             elif kind in ("press", "release"):
                 button = mouse.Button[action[2][6:]]
-                self.mouse.position = (action[3], action[4])
+                self.place_pointer(action[3], action[4])
                 if kind == "press":
                     self.mark_synthetic({action[2]})
                     self.held_codes.add(action[2])
@@ -5047,6 +5391,11 @@ class AutoClicker:
                     self.held_codes.discard(action[2])
                     if ("keyboard", key) in self.held:
                         self.held.remove(("keyboard", key))
+
+    def place_pointer(self, x, y):
+        """Put the pointer on a spot (without sending movement a game would turn with)."""
+        self.pointer.place(x, y)
+        self.replay_pos = (x, y)
 
     def click_loop(self):
         while not self.shutdown.is_set():
@@ -5125,11 +5474,7 @@ class AutoClicker:
             self.record_event("scroll", int(dx), int(dy), int(x), int(y))
 
     def on_mouse_move(self, x, y):
-        if self.recording_active and self.record_movement:
-            now = time.monotonic()
-            if now - self.record_last_move >= self.MOVE_SAMPLE:
-                self.record_last_move = now
-                self.record_event("move", int(x), int(y))
+        self.note_motion(x=x, y=y)
         # Auto stop: notice when you move the mouse away while it's clicking
         if not self.running.is_set() or not self.settings.get("auto_stop"):
             return
