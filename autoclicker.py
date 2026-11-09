@@ -46,6 +46,9 @@ CARD_COLUMNS_MAX = 3
 MENU_FILL = 0.4  # with a side menu, the button card reaches about this far down it
 SIDEBAR_SIDES = ("Left", "Right", "Top", "Bottom")  # where the menu can go
 BADGE_SHOW = ("While running", "Always", "Off")       # when the floating card shows
+# Recording accuracy: how often mouse movement is written down (seconds between "move"
+# lines). Higher is smoother but makes bigger profiles. Clicks and keys are always exact.
+ACCURACY = {"Lowest": 0.1, "Low": 0.05, "Medium": 0.03, "High": 0.015, "Ultra": 0.004}
 BADGE_CORNERS = ("Top left", "Top right", "Bottom left", "Bottom right")
 BAR_EXTRA_HEIGHT = 70  # extra window height a top/bottom menu needs
 MINI_GAP = 8     # space between the boxes in mini mode
@@ -121,8 +124,11 @@ DEFAULTS = {
     "replay_loop": True,       # play the recording over and over
     "replay_limit_on": False,  # ...but stop after a set number of plays
     "replay_limit": 5,
+    "replay_speed": 1.0,       # 2 = twice as fast, 0.5 = half speed
     "record_keys_only": False, # record only the keyboard
     "record_moves": True,      # record mouse movement (off: only clicks and scrolls)
+    "record_repeats": False,   # keep the same key/button pressed twice very quickly
+    "record_accuracy": "High", # how smoothly mouse movement is recorded, see ACCURACY
     "recording": None,         # list of recorded actions, see AutoClicker.record_event
     # shared
     "active_mode": "mouse",    # which clicker the start/stop key runs: follows the page
@@ -137,6 +143,7 @@ DEFAULTS = {
     "badge_show": "While running",  # floating card: While running / Always / Off
     "badge_corner": "Top left",     # which corner of the screen it sits in
     "finish_sound": True,      # play a sound when a run finishes by itself
+    "countdown": True,         # count down the start delay (3, 2, 1) on the badge
     "text_size": "Normal",     # Small / Normal / Large
     "dark_mode": False,
     "accent": "#4a8fd9",
@@ -381,6 +388,7 @@ def clean_settings(saved, base=None) -> dict:
     for name in ("click_delay", "time_limit", "kb_time_limit"):
         if settings[name] <= 0:
             settings[name] = DEFAULTS[name]
+    settings["replay_speed"] = min(max(settings["replay_speed"], SPEED_MIN), SPEED_MAX)
     if settings["button"] not in BUTTONS:
         settings["button"] = DEFAULTS["button"]
     if settings["click_type"] not in CLICK_TYPES:
@@ -396,6 +404,8 @@ def clean_settings(saved, base=None) -> dict:
         settings["kb_key"] = DEFAULTS["kb_key"]
     if isinstance(saved, dict) and "badge_show" not in saved and saved.get("floating_badge") is False:
         settings["badge_show"] = "Off"  # older versions had an on/off switch
+    if settings["record_accuracy"] not in ACCURACY:
+        settings["record_accuracy"] = DEFAULTS["record_accuracy"]
     if settings["badge_show"] not in BADGE_SHOW:
         settings["badge_show"] = DEFAULTS["badge_show"]
     if settings["badge_corner"] not in BADGE_CORNERS:
@@ -458,6 +468,15 @@ def read_recording(path: Path):
     except (OSError, ValueError):
         return None
     return clean_recording(data.get("inputs") if isinstance(data, dict) else data)
+
+
+SPEED_MIN, SPEED_MAX = 0.1, 10.0  # replay speed limits
+
+
+def on_wayland() -> bool:
+    """True on a Wayland session, where the clicking and key presses can't reach most apps."""
+    session = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    return session == "wayland" or (session != "x11" and bool(os.environ.get("WAYLAND_DISPLAY")))
 
 
 def safe_profile_name(name: str) -> str:
@@ -1241,6 +1260,7 @@ class RoundedCombo(tk.Canvas):
         self.popup = None
         self.closed_at = 0.0
         self.placeholder = ""  # shown in grey when nothing is chosen
+        self.max_items = None  # how many options the list shows before it scrolls
 
         self.var.trace_add("write", lambda *_: self.redraw())
         self.bind("<Configure>", lambda e: self.redraw())
@@ -1309,11 +1329,15 @@ class RoundedCombo(tk.Canvas):
 
 
 class DropdownPopup(tk.Toplevel):
-    """The rounded list that opens under a RoundedCombo.
-    Click an item to pick it; click anywhere else or press Esc to close."""
+    """The rounded list that opens under a RoundedCombo (or above it, if there's more room
+    there). Click an item to pick it; click anywhere else or press Esc to close. If the
+    list doesn't fit on the screen, it scrolls: mouse wheel, arrow keys, or drag the bar."""
 
-    ITEM_H = 30  # height of each item
-    PAD = 5      # space inside the list's edge
+    ITEM_H = 30     # height of each item
+    PAD = 5         # space inside the list's edge
+    MAX_ITEMS = 8   # longer lists scroll
+    BAR_ROOM = 12   # space on the right for the scroll bar, when there is one
+    BAR_W = 4       # scroll bar thickness
 
     def __init__(self, combo):
         root = combo.winfo_toplevel()
@@ -1330,22 +1354,57 @@ class DropdownPopup(tk.Toplevel):
         except tk.TclError:
             pass
 
+        # Fit on the monitor the box is on: below it if the whole list fits there (or
+        # there's more room below than above), otherwise above it
         self.w = combo.winfo_width()
-        self.h = len(self.values) * self.ITEM_H + self.PAD * 2
-        x = combo.winfo_rootx()
-        y = combo.winfo_rooty() + combo.winfo_height() + 4
-        if y + self.h > self.winfo_screenheight():  # no room below: open above instead
-            y = combo.winfo_rooty() - self.h - 4
+        n = len(self.values)
+        cx, cy, ch = combo.winfo_rootx(), combo.winfo_rooty(), combo.winfo_height()
+        area = (0, 0, self.winfo_screenwidth(), self.winfo_screenheight())
+        for ax, ay, aw, ah in screen_areas():
+            if ax <= cx < ax + aw and ay <= cy < ay + ah:
+                area = (ax, ay, aw, ah)
+                break
+        ax, ay, aw, ah = area
+        below = ay + ah - (cy + ch + 4) - 4  # room under the box
+        above = cy - 4 - ay - 4              # room over it
+
+        def items_in(room):
+            return max(1, min(n, most, (room - self.PAD * 2) // self.ITEM_H))
+
+        most = combo.max_items or self.MAX_ITEMS
+        wanted = min(n, most)
+        open_below = items_in(below) >= wanted or below >= above
+        self.visible = items_in(below if open_below else above)
+        self.scrolls = self.visible < n
+        self.h = self.visible * self.ITEM_H + self.PAD * 2
+        y = cy + ch + 4 if open_below else cy - self.h - 4
+        x = max(ax, min(cx, ax + aw - self.w))
+        # start scrolled so the chosen item shows
+        current = combo.var.get()
+        chosen = self.values.index(current) if current in self.values else 0
+        self.top = max(0, min(chosen - self.visible // 2, n - self.visible))
+        self.pos = float(self.top)  # where the list is drawn from: glides towards self.top
+        self.glide_job = None
+        self.drag_from = None  # (pointer y, top) while dragging the scroll bar
+        self.set_alpha(0.0)  # hidden until its corners are cut round (see below)
         self.geometry(f"{self.w}x{self.h}+{x}+{y}")
 
-        # The window itself is square, so its corners are painted in the app's
-        # background colour; sitting over the app, the list looks rounded.
-        self.canvas = tk.Canvas(self, width=self.w, height=self.h, bg=p["bg"],
+        # The window's corners are cut round once it's on screen (round_window); the
+        # canvas behind the list matches the list, so no square corners ever show
+        self.canvas = tk.Canvas(self, width=self.w, height=self.h, bg=p["field"],
                                 highlightthickness=0, bd=0, cursor="hand2")
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Motion>", lambda e: self.set_hover(self.index_at(e.y)))
         self.canvas.bind("<Leave>", lambda e: self.set_hover(None))
-        self.bind("<ButtonPress>", self.on_press)
+        self.bind("<ButtonPress-1>", self.on_press)
+        self.bind("<ButtonPress-2>", self.on_press)
+        self.bind("<ButtonPress-3>", self.on_press)
+        self.bind("<B1-Motion>", self.on_drag)
+        self.bind("<ButtonRelease-1>", self.end_drag)
+        # the wheel scrolls this list only, never the page behind it ("break")
+        self.bind("<Button-4>", lambda e: (self.scroll(-1), "break")[1])
+        self.bind("<Button-5>", lambda e: (self.scroll(1), "break")[1])
+        self.bind("<MouseWheel>", lambda e: (self.scroll(-1 if e.delta > 0 else 1), "break")[1])
         self.bind("<Escape>", lambda e: self.close())
         self.bind("<Up>", lambda e: self.move(-1))
         self.bind("<Down>", lambda e: self.move(1))
@@ -1354,6 +1413,9 @@ class DropdownPopup(tk.Toplevel):
 
         try:
             self.wait_visibility()
+            self.update_idletasks()
+            round_window(self, FIELD_RADIUS, self.w, self.h)
+            self.set_alpha(1.0)
             try:
                 self.grab_set_global()  # so a click anywhere (even outside the app) closes it
             except tk.TclError:
@@ -1362,11 +1424,60 @@ class DropdownPopup(tk.Toplevel):
         except tk.TclError:
             pass
 
+    def set_alpha(self, value):
+        try:
+            self.attributes("-alpha", value)
+        except tk.TclError:
+            pass
+
     def index_at(self, y):
-        i = int((y - self.PAD) // self.ITEM_H)
+        i = math.floor(self.pos + (y - self.PAD) / self.ITEM_H)
         if self.PAD <= y < self.h - self.PAD and 0 <= i < len(self.values):
             return i
         return None
+
+    def scroll(self, step):
+        top = max(0, min(self.top + step, len(self.values) - self.visible))
+        if top != self.top:
+            self.top = top
+            if self.glide_job is None:
+                self.glide()
+
+    def glide(self):
+        """Slide the list towards self.top a bit each frame, easing to a stop."""
+        left = self.top - self.pos
+        self.pos = float(self.top) if abs(left) < 0.02 else self.pos + left * 0.35
+        pointer = self.winfo_pointery() - self.winfo_rooty()
+        self.hover = self.index_at(pointer)
+        self.redraw()
+        self.glide_job = self.after(10, self.glide) if self.pos != self.top else None
+
+    def bar(self):
+        """The scroll bar's (x, top, bottom), or None if the list doesn't scroll."""
+        if not self.scrolls:
+            return None
+        track_top, track_bottom = self.PAD + 3, self.h - self.PAD - 3
+        track = track_bottom - track_top
+        length = max(18, track * self.visible / len(self.values))
+        spare = len(self.values) - self.visible
+        top = track_top + (track - length) * self.pos / spare
+        return self.w - self.PAD - self.BAR_ROOM / 2, top, top + length
+
+    def end_drag(self, _event):
+        if self.drag_from is not None:
+            self.drag_from = None
+            self.redraw()
+
+    def on_drag(self, event):
+        if self.drag_from is None:
+            return
+        start_y, start_top = self.drag_from
+        _, top, bottom = self.bar()
+        track = self.h - 2 * (self.PAD + 3) - (bottom - top)
+        spare = len(self.values) - self.visible
+        if track > 0:
+            moved = (event.y_root - start_y) / track * spare
+            self.scroll(round(start_top + moved) - self.top)
 
     def set_hover(self, index):
         if index != self.hover:
@@ -1380,14 +1491,29 @@ class DropdownPopup(tk.Toplevel):
             self.set_hover((start + step) % len(self.values))
         else:
             self.set_hover((self.hover + step) % len(self.values))
+        # keep the highlighted item in view
+        if self.hover < self.top:
+            self.scroll(self.hover - self.top)
+        elif self.hover >= self.top + self.visible:
+            self.scroll(self.hover - self.top - self.visible + 1)
 
     def on_press(self, event):
         x = event.x_root - self.winfo_rootx()
         y = event.y_root - self.winfo_rooty()
-        if 0 <= x < self.w and 0 <= y < self.h:
-            self.pick(self.index_at(y))
-        else:
+        if not (0 <= x < self.w and 0 <= y < self.h):
             self.close()
+            return
+        bar = self.bar()
+        if bar and x >= self.w - self.PAD - self.BAR_ROOM:  # on the scroll bar
+            if event.num != 1:
+                return
+            _, top, bottom = bar
+            if top <= y <= bottom:
+                self.drag_from = (event.y_root, self.top)
+            else:  # above or below the handle: a page that way
+                self.scroll(-self.visible if y < top else self.visible)
+            return
+        self.pick(self.index_at(y))
 
     def pick(self, index):
         if index is not None:
@@ -1397,29 +1523,45 @@ class DropdownPopup(tk.Toplevel):
     def redraw(self):
         c, p = self.canvas, self.palette
         c.delete("all")
-        c.create_polygon(rounded_points(1, 1, self.w - 1, self.h - 1, FIELD_RADIUS),
-                         smooth=True, fill=p["field"], outline=p["border"])
         current = self.combo.var.get()
-        for i, value in enumerate(self.values):
-            y1 = self.PAD + i * self.ITEM_H
+        right = self.w - self.PAD - (self.BAR_ROOM if self.scrolls else 0)
+        first = math.floor(self.pos)
+        for i in range(first, min(len(self.values), first + self.visible + 1)):
+            value = self.values[i]
+            y1 = self.PAD + (i - self.pos) * self.ITEM_H
             text_color = p["fg"]
             if i == self.hover:
-                c.create_polygon(rounded_points(self.PAD, y1 + 1, self.w - self.PAD,
+                c.create_polygon(rounded_points(self.PAD, y1 + 1, right,
                                                 y1 + self.ITEM_H - 1, 6),
                                  smooth=True, fill=p["select"], outline="")
                 text_color = p["select_fg"]
             c.create_text(12, y1 + self.ITEM_H / 2, text=value, anchor="w",
                           fill=text_color, font="TkTextFont")
             if value == current:  # tick next to the chosen item
-                cx, cy = self.w - 18, y1 + self.ITEM_H / 2
+                cx, cy = right - 13, y1 + self.ITEM_H / 2
                 c.create_line(cx - 4, cy, cx - 1, cy + 3, cx + 5, cy - 4,
                               fill=text_color if i == self.hover else p["accent"],
                               width=2, capstyle="round", joinstyle="round")
+        # While gliding, options can be half out of view: tidy the edges, then the border
+        for y1, y2 in ((0, self.PAD), (self.h - self.PAD, self.h)):
+            c.create_rectangle(0, y1, self.w, y2, fill=p["field"], outline="")
+        c.create_polygon(rounded_points(1, 1, self.w - 1, self.h - 1, FIELD_RADIUS),
+                         smooth=True, fill="", outline=p["border"])
+        bar = self.bar()
+        if bar:  # a thin rounded scroll bar on the right
+            x, top, bottom = bar
+            r = self.BAR_W / 2
+            c.create_line(x, top + r, x, bottom - r, width=self.BAR_W, capstyle="round",
+                          fill=(mix_color(p["muted"], p["fg"], 0.35) if self.drag_from
+                                else mix_color(p["border"], p["muted"], 0.6)))
 
     def close(self):
         if self.closed:
             return
         self.closed = True
+        if self.glide_job is not None:
+            self.after_cancel(self.glide_job)
+            self.glide_job = None
         try:
             self.grab_release()
         except tk.TclError:
@@ -1796,8 +1938,11 @@ class ToggleSwitch(tk.Canvas):
             track = mix_color(track, p["fg"], 0.12)
         if self.image is None:
             self.image = tk.PhotoImage(width=self.TRACK_W, height=self.TRACK_H)
-        render_switch(self.image, self.TRACK_W, self.TRACK_H, self.KNOB_PAD,
-                      self.pos, track, p["bg"])
+        look = (round(self.pos, 3), track, p["bg"])
+        if look != getattr(self, "drawn", None):  # only redo the pixels if it looks different
+            self.drawn = look
+            render_switch(self.image, self.TRACK_W, self.TRACK_H, self.KNOB_PAD,
+                          self.pos, track, p["bg"])
         self.create_image(w - 2 - self.TRACK_W, (h - self.TRACK_H) // 2,
                           image=self.image, anchor="nw")
 
@@ -1957,9 +2102,14 @@ class ColorSwatches(tk.Canvas):
                 mark, mark_color = "plus", p["fg"]
             else:
                 mark, mark_color = None, p["fg"]
-            render_swatch(self.images[i], self.SIZE, self.RADIUS, fill, p["bg"],
-                          p["fg"] if hovered else p["border"], 2 if hovered else 1,
-                          mark, mark_color)
+            look = (fill, p["bg"], p["fg"] if hovered else p["border"], hovered, mark, mark_color)
+            if not hasattr(self, "drawn"):
+                self.drawn = {}
+            if self.drawn.get(i) != look:  # only redo the pixels if it looks different
+                self.drawn[i] = look
+                render_swatch(self.images[i], self.SIZE, self.RADIUS, fill, p["bg"],
+                              p["fg"] if hovered else p["border"], 2 if hovered else 1,
+                              mark, mark_color)
             x = self.PAD + i * (self.SIZE + self.GAP)
             self.create_image(x, self.PAD, image=self.images[i], anchor="nw")
 
@@ -2320,8 +2470,65 @@ class StatusDot(tk.Canvas):
             paint_dot(self.image, self.SIZE, p["accent"] if self.on else p["border"], p["bg"])
 
 
+_areas = {"when": 0.0, "areas": None, "busy": False}  # see screen_areas
+
+
 def screen_areas():
-    """[(x, y, w, h)] for each monitor, trimmed to the usable area (not under panels)."""
+    """[(x, y, w, h)] for each monitor, trimmed to the usable area (not under panels).
+
+    Looking this up takes about a tenth of a second, so the answer is kept: after half a
+    minute it's looked up again in the background (monitors can be plugged in), while the
+    kept answer is used straight away."""
+    if _areas["areas"] is None:
+        _areas["areas"], _areas["when"] = read_screen_areas(), time.monotonic()
+    elif time.monotonic() - _areas["when"] > 30 and not _areas["busy"]:
+        _areas["busy"] = True
+
+        def refresh():
+            try:
+                _areas["areas"], _areas["when"] = read_screen_areas(), time.monotonic()
+            finally:
+                _areas["busy"] = False
+
+        threading.Thread(target=refresh, daemon=True).start()
+    return list(_areas["areas"])
+
+
+def read_screen_areas():
+    """screen_areas without keeping the answer. Asks X directly (quick); if that doesn't
+    work, runs xrandr and xprop instead (which can take a while)."""
+    try:
+        from Xlib import display as xdisplay, X
+        d = xdisplay.Display()
+        try:
+            root = d.screen().root
+            monitors = [(m.x, m.y, m.width_in_pixels, m.height_in_pixels)
+                        for m in root.xrandr_get_monitors().monitors]
+            prop = root.get_full_property(d.intern_atom("_NET_WORKAREA"), X.AnyPropertyType)
+            work = list(prop.value[:4]) if prop is not None else None
+        finally:
+            d.close()
+        if monitors:
+            return trim_to_work_area(monitors, work)
+    except Exception:
+        pass
+    return read_screen_areas_slowly()
+
+
+def trim_to_work_area(monitors, work):
+    """Each monitor's (x, y, w, h), minus any panel space outside the work area."""
+    if not work:
+        return monitors
+    wx, wy, ww, wh = work
+    trimmed = []
+    for x, y, w, h in monitors or [(wx, wy, ww, wh)]:
+        top, bottom = max(y, wy), min(y + h, wy + wh)
+        left, right = max(x, wx), min(x + w, wx + ww)
+        trimmed.append((left, top, right - left, bottom - top))
+    return trimmed
+
+
+def read_screen_areas_slowly():
     monitors = []
     try:
         out = subprocess.run(["xrandr", "--listmonitors"], capture_output=True, text=True,
@@ -2334,13 +2541,8 @@ def screen_areas():
     try:
         out = subprocess.run(["xprop", "-root", "_NET_WORKAREA"], capture_output=True,
                              text=True, timeout=2).stdout
-        wx, wy, ww, wh = (int(v) for v in re.findall(r"\d+", out.split("=", 1)[1])[:4])
-        trimmed = []
-        for x, y, w, h in monitors or [(wx, wy, ww, wh)]:
-            top, bottom = max(y, wy), min(y + h, wy + wh)
-            left, right = max(x, wx), min(x + w, wx + ww)
-            trimmed.append((left, top, right - left, bottom - top))
-        return trimmed
+        work = [int(v) for v in re.findall(r"\d+", out.split("=", 1)[1])[:4]]
+        return trim_to_work_area(monitors, work)
     except (OSError, subprocess.SubprocessError, IndexError, ValueError):
         return monitors
 
@@ -2498,7 +2700,6 @@ class FloatingBadge(tk.Toplevel):
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<ButtonRelease-1>", lambda e: on_click())
         self.dot = tk.PhotoImage(width=8, height=8)
-        self.areas = screen_areas()
         base = tkfont.nametofont("TkDefaultFont").actual()
         self.title_font = tkfont.Font(family=base["family"], size=base["size"], weight="bold")
         self.detail_font = tkfont.Font(family=base["family"], size=max(base["size"] - 1, 7))
@@ -2540,8 +2741,9 @@ class FloatingBadge(tk.Toplevel):
             c.create_text(self.PAD_X + 16, y, text=text, anchor="nw", fill=color, font=font)
             y += line_h
         # the chosen corner of the monitor the app window is on (clear of any panels)
-        x0, y0, w0, h0 = self.areas[0] if self.areas else (0, 0, 1280, 720)
-        for x, y, w, h in self.areas:
+        areas = screen_areas()
+        x0, y0, w0, h0 = areas[0] if areas else (0, 0, 1280, 720)
+        for x, y, w, h in areas:
             if x <= near[0] < x + w and y <= near[1] < y + h:
                 x0, y0, w0, h0 = x, y, w, h
                 break
@@ -2680,6 +2882,67 @@ class RecordingEditor(tk.Toplevel):
         self.on_save(recording, skipped)
 
 
+class SmallDialog(tk.Toplevel):
+    """A small window with a message, an optional name box, and buttons.
+
+    With `name` (the starting text) it shows a text box; ok(text) is called with what was
+    typed and returns an error message to show, or None to close. Without it, it's just a
+    message with an OK button."""
+
+    def __init__(self, parent, title, message, palette, ok_text="OK", name=None, ok=None):
+        super().__init__(parent)
+        p = palette
+        self.ok = ok
+        self.title(title)
+        self.configure(bg=p["bg"])
+        self.resizable(False, False)
+        self.transient(parent)
+        body = tk.Frame(self, bg=p["bg"], padx=18, pady=16)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        tk.Label(body, text=message, bg=p["bg"], fg=p["fg"], wraplength=340, justify="left",
+                 anchor="w").grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.name = None
+        if name is not None:
+            self.name = tk.StringVar(value=name)
+            entry = RoundedEntry(body, self.name, on_enter=self.confirm, width=340)
+            entry.set_palette(p)
+            entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+            entry.entry.select_range(0, "end")
+            self.after(50, entry.entry.focus_set)
+        self.message = tk.Label(body, text="", bg=p["bg"], fg=p["muted"], anchor="w",
+                                wraplength=340, justify="left")
+        self.message.grid(row=2, column=0, columnspan=2, sticky="ew")
+        buttons = []
+        if name is not None:
+            buttons.append(RoundedButton(body, "Cancel", self.destroy, height=34))
+        done = RoundedButton(body, ok_text, self.confirm, height=34, selectable=True, accent=True)
+        buttons.append(done)
+        for column, button in enumerate(buttons):
+            button.set_palette(p)
+            button.grid(row=3, column=column, columnspan=2 if len(buttons) == 1 else 1,
+                        sticky="ew", pady=(12, 0),
+                        padx=0 if len(buttons) == 1 else ((0, 5) if column == 0 else (5, 0)))
+        done.set_selected(True)
+        self.bind("<Escape>", lambda e: self.destroy())
+        if name is None:
+            self.bind("<Return>", lambda e: self.confirm())
+        # in the middle of the app window
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_reqwidth()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_reqheight()) // 3
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.focus_force()
+
+    def confirm(self):
+        problem = self.ok(self.name.get() if self.name else None) if self.ok else None
+        if problem:
+            self.message.configure(text=problem, pady=4)
+        else:
+            self.destroy()
+
+
 def render_cap(image, w, h, top, color, bg_color, samples=4):
     """Draw one rounded end of a scroll bar thumb (a half circle `w` wide, `h` tall) into
     a PhotoImage, with smooth edges. `top` picks the upper or the lower end."""
@@ -2797,7 +3060,9 @@ class RoundedScrollbar(tk.Canvas):
         p = self.palette
         active = self.hover or self.drag_offset is not None
         width = self.WIDE if active else self.THIN
-        color = p["muted"] if active else p["border"]
+        # easy to spot on both light and dark pages, and a bit stronger under the mouse
+        color = (mix_color(p["muted"], p["fg"], 0.35) if active
+                 else mix_color(p["border"], p["muted"], 0.6))
         top, bottom = round(self.handle()[0]), round(self.handle()[1])
         x = (self.winfo_width() - width) // 2
         cap = width // 2
@@ -2815,7 +3080,7 @@ class ScrollArea(ttk.Frame):
 
     def __init__(self, parent):
         super().__init__(parent)
-        self.canvas = tk.Canvas(self, highlightthickness=0, bd=0, yscrollincrement=20)
+        self.canvas = tk.Canvas(self, highlightthickness=0, bd=0, yscrollincrement=1)
         self.bar = RoundedScrollbar(self, command=self.canvas.yview)
         self.inner = ttk.Frame(self.canvas)
         self.window = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
@@ -2826,6 +3091,8 @@ class ScrollArea(ttk.Frame):
         self.rowconfigure(0, weight=1)
         self.palette = None
         self.bar_job = None  # see update_scroll
+        self.glide_job = None    # the mouse wheel's smooth scrolling, see glide_by
+        self.glide_target = 0.0  # where it's heading (pixels from the top)
         self.inner.bind("<Configure>", lambda e: self.update_scroll())
         self.canvas.bind("<Configure>", self.on_resize)
         self.bind("<Enter>", lambda e: self.wheel(True))
@@ -2875,10 +3142,48 @@ class ScrollArea(ttk.Frame):
     def on_wheel(self, event):
         if not self.needs_scrolling():
             return
+        try:
+            if event.widget.winfo_toplevel() is not self.winfo_toplevel():
+                return  # over a dropdown list or another window, not this page
+        except (AttributeError, tk.TclError):
+            return
+        if any(isinstance(w, DropdownPopup) for w in self.winfo_toplevel().winfo_children()):
+            return  # a dropdown list is open: leave the page where it is
         if event.num == 4 or getattr(event, "delta", 0) > 0:
-            self.canvas.yview_scroll(-2, "units")
+            self.glide_by(-self.WHEEL_STEP)
         else:
-            self.canvas.yview_scroll(2, "units")
+            self.glide_by(self.WHEEL_STEP)
+
+    WHEEL_STEP = 60   # pixels per notch of the mouse wheel
+    GLIDE_MS = 10     # time between frames of the glide
+
+    def glide_by(self, pixels):
+        """Scroll smoothly: each frame covers part of the way left, so it starts quick and
+        eases to a stop. Turning the wheel again while it moves adds on to where it's heading."""
+        height = self.inner.winfo_reqheight()
+        most = max(0, height - self.canvas.winfo_height())
+        now = self.canvas.yview()[0] * height
+        start = self.glide_target if self.glide_job is not None else now
+        self.glide_target = min(max(start + pixels, 0), most)
+        if self.glide_job is None:
+            self.glide_step()
+
+    def glide_step(self):
+        height = max(1, self.inner.winfo_reqheight())
+        now = self.canvas.yview()[0] * height
+        left = self.glide_target - now
+        if abs(left) < 1:
+            self.canvas.yview_moveto(self.glide_target / height)
+            self.glide_job = None
+            return
+        step = left * 0.3
+        if abs(step) < 1:
+            step = 1 if left > 0 else -1
+        self.canvas.yview_moveto((now + step) / height)
+        if abs(self.canvas.yview()[0] * height - now) < 0.5:
+            self.glide_job = None  # can't go any further (e.g. the page got shorter)
+            return
+        self.glide_job = self.after(self.GLIDE_MS, self.glide_step)
 
     def set_palette(self, palette):
         self.palette = palette
@@ -3087,6 +3392,7 @@ class RawMotion:
         source, mask_len = struct.unpack_from("=HH", data, 10)
         if source not in self.devices:
             self.load_devices()  # a mouse was plugged in
+            self.devices.setdefault(source, False)  # (only look it up once)
         if not self.devices.get(source):
             return
         mask = int.from_bytes(data[22:22 + 4 * mask_len], "little")
@@ -3107,13 +3413,16 @@ class AutoClicker:
     SYNTHETIC_WINDOW = 0.03  # seconds: presses this soon after our own click/press are ours
     REPEAT_WINDOW = 0.2      # seconds: the same key again this soon is a duplicate/held key
     MOVE_TOLERANCE = 10      # pixels: auto stop ignores mouse wobbles smaller than this
-    MOVE_SAMPLE = 0.015      # seconds: record at most one mouse move this often
+    QUICK_REPEAT = 0.1       # seconds: the same key/button again this soon is recorded once
 
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Auto Clicker")
         self.root.geometry(WINDOW_SIZE)
         self.root.minsize(*MIN_SIZE)
+        # See-through while it's laid out, so it appears all at once (see reveal). Tk can
+        # only do that once the window exists on screen, so it's done the moment it appears.
+        self.root.bind("<Map>", self.hide_until_ready, add="+")
         self.set_window_icon()
 
         self.mouse = mouse.Controller()
@@ -3129,6 +3438,8 @@ class AutoClicker:
         self.armed = False  # True during start delay or while running
         self.started_at = 0.0     # when clicking began (for "stop after a set time")
         self.round_widgets = []  # every custom-drawn widget, so the theme can reach them
+        self.subtitles_to_fit = []  # see fit_subtitles
+        self.quick_exit = False     # see on_close (main() turns it on)
         self.nav_buttons = {}
         self.key_choosers = []
         self.optional_rows = []   # (widgets, should_show) pairs, see show_optional_rows
@@ -3152,13 +3463,17 @@ class AutoClicker:
         self.recording_buf = []
         self.record_t0 = 0.0
         self.record_last_move = 0.0
-        # mouse movement waiting to be recorded (one "move" at most every MOVE_SAMPLE)
+        # mouse movement waiting to be recorded (one "move" at most every move_sample)
+        self.move_sample = ACCURACY["High"]  # seconds, set by the accuracy when recording
         self.motion_lock = threading.RLock()
         self.raw_motion = None        # RawMotion listener, while recording movement
         self.record_pos = None        # where the pointer is
         self.record_dx = self.record_dy = 0.0  # how far the mouse moved since the last move
         self.record_moved = False     # something above changed since the last move
         self.record_pressed = set()   # buttons/keys pressed since recording began
+        self.record_skipped = set()   # pressed again too quickly: left out, with their release
+        self.record_last_press = {}   # input code -> when it was last recorded as pressed
+        self.record_keep_repeats = False
         self.record_exclude = set()   # the app's own keys, never recorded
         self.record_rect = None       # the app window, to trim clicks on "Stop recording"
         self.record_from_button = False
@@ -3190,8 +3505,33 @@ class AutoClicker:
 
         if self.needs_settings_rewrite:
             self.save_settings()  # takes the old built-in recording out of settings.json
+        if on_wayland():
+            self.root.after(600, self.warn_wayland)
+        # look up the monitors now, so the first dropdown opens straight away
+        threading.Thread(target=screen_areas, daemon=True).start()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.poll()
+        self.root.after(0, self.reveal)
+
+    REVEAL_SETTLE_MS = 120  # how long to let the layout settle once the window is on screen
+
+    def hide_until_ready(self, event):
+        if event.widget is self.root and not getattr(self, "revealed", False):
+            self.revealed = True
+            if not self.mini.get():
+                self.set_alpha(0.0)
+
+    def reveal(self, waited=0):
+        """Show the window (it starts see-through) once it's on screen and everything in it
+        is laid out and drawn, so the buttons don't pop in one by one."""
+        if self.mini.get():
+            return  # mini mode fades itself in once it's ready (see apply_mini)
+        if not getattr(self, "revealed", False) and waited < 5000:
+            self.root.after(20, lambda: self.reveal(waited + 20))
+            return
+        self.root.update_idletasks()
+        self.root.after(self.REVEAL_SETTLE_MS,
+                        lambda: (self.root.update_idletasks(), self.set_alpha(1.0)))
 
     def set_window_icon(self):
         """Give the window, dock and app list the icon that suits the computer's light/dark
@@ -3287,6 +3627,9 @@ class AutoClicker:
         self.replay_limit = tk.IntVar(value=saved["replay_limit"])
         self.record_keys_only = tk.BooleanVar(value=saved["record_keys_only"])
         self.record_moves = tk.BooleanVar(value=saved["record_moves"])
+        self.record_repeats = tk.BooleanVar(value=saved["record_repeats"])
+        self.record_accuracy = tk.StringVar(value=saved["record_accuracy"])
+        self.replay_speed = tk.DoubleVar(value=saved["replay_speed"])
         # Profiles
         self.profile_name = tk.StringVar()
         self.profile_choice = tk.StringVar(value=next(iter(list_profiles()), ""))
@@ -3310,6 +3653,8 @@ class AutoClicker:
         self.badge_show = tk.StringVar(value=saved["badge_show"])
         self.badge_corner = tk.StringVar(value=saved["badge_corner"])
         self.finish_sound = tk.BooleanVar(value=saved["finish_sound"])
+        self.countdown = tk.BooleanVar(value=saved["countdown"])
+        self.begin_at = 0.0  # when the start delay ends (for the countdown)
         self.text_size = tk.StringVar(value=saved["text_size"])
         self.dark = tk.BooleanVar(value=saved["dark_mode"])
         self.accent = tk.StringVar(value=saved["accent"])
@@ -3329,7 +3674,9 @@ class AutoClicker:
             "kb_time_limit": self.kb_time_limit, "kb_hold": self.kb_hold,
             "replay_loop": self.replay_loop,
             "replay_limit_on": self.replay_limit_on, "replay_limit": self.replay_limit,
+            "replay_speed": self.replay_speed,
             "record_keys_only": self.record_keys_only, "record_moves": self.record_moves,
+            "record_repeats": self.record_repeats, "record_accuracy": self.record_accuracy,
             "multi_location": self.multi_location,
         }
 
@@ -3348,6 +3695,8 @@ class AutoClicker:
                                                           self.save_settings()))
         self.profile_choice.trace_add("write", lambda *_: self.show_profile_hotkey())
         self.finish_sound.trace_add("write", lambda *_: self.save_settings())
+        self.countdown.trace_add("write", lambda *_: (self.refresh_running(),
+                                                       self.save_settings()))
         self.text_size.trace_add("write", lambda *_: (self.apply_text_size(), self.save_settings()))
         self.profile_hotkey.trace_add("write", lambda *_: self.on_profile_hotkey_set())
         for var in (self.location_on, self.multi_location):
@@ -3415,10 +3764,12 @@ class AutoClicker:
         self.build_settings_page(self.pages["settings"])
         self.mini_frame = ttk.Frame(self.root, padding=MINI_MARGIN, style="Edge.TFrame")
         self.build_mini_view(self.mini_frame)
+        self.fit_subtitles()
 
         for var in (self.click_delay_on, self.limit_on, self.time_limit_on, self.location_on,
                     self.multi_location, self.hold, self.kb_limit_on, self.kb_time_limit_on,
-                    self.kb_hold, self.replay_loop, self.replay_limit_on, self.record_keys_only):
+                    self.kb_hold, self.replay_loop, self.replay_limit_on, self.record_keys_only,
+                    self.record_moves):
             var.trace_add("write", lambda *_: self.show_optional_rows())
         self.show_optional_rows()
 
@@ -3438,6 +3789,22 @@ class AutoClicker:
         self.mini.trace_add("write", lambda *_: self.apply_mini())
         if self.mini.get():  # once the window is on screen (its title bar can't go before)
             self.root.after(150, lambda: self.apply_mini(save=False))
+
+    def fit_subtitles(self):
+        """Give each row's grey text room for the box next to it (see card_row)."""
+        def width(box):
+            # A box's width is known straight away, except a frame of buttons, which only
+            # knows once the whole window is laid out (slow): add up its buttons instead
+            kids = box.winfo_children()
+            if box.winfo_reqwidth() > 1 or not kids:
+                return box.winfo_reqwidth()
+            return sum(width(k) for k in kids) + 10 * (len(kids) - 1)
+
+        for row, box, subtitle, has_switch in self.subtitles_to_fit:
+            wrap = max(200, 400 - width(box) - (48 if has_switch else 0))
+            subtitle.configure(wraplength=wrap)
+            row.parts["wrap"] = wrap
+        self.subtitles_to_fit = []
 
     # ---- widget factories (each registers itself for theming) ----
     def register(self, widget, surface=None):
@@ -3462,8 +3829,10 @@ class AutoClicker:
     def make_spin(self, parent, variable, from_, to, increment):
         return self.register(RoundedSpin(parent, variable, from_, to, increment))
 
-    def make_combo(self, parent, variable, values, width=FIELD_WIDTH):
-        return self.register(RoundedCombo(parent, variable, values, width=width))
+    def make_combo(self, parent, variable, values, width=FIELD_WIDTH, max_items=None):
+        combo = self.register(RoundedCombo(parent, variable, values, width=width))
+        combo.max_items = max_items  # (fewer than all of them: the list scrolls)
+        return combo
 
     def make_switch(self, parent, text, variable):
         return self.register(ToggleSwitch(parent, text, variable))
@@ -3609,9 +3978,9 @@ class AutoClicker:
             if value_show:
                 self.optional_rows.append(((box,), value_show))
             if subtitle_label is not None:  # leave room for the box (and switch) next to the words
-                box.update_idletasks()      # so a row of buttons knows how wide it is
-                room = 400 - box.winfo_reqwidth() - (48 if variable is not None else 0)
-                subtitle_label.configure(wraplength=max(200, room))
+                # (worked out in fit_subtitles once everything is built: measuring each box
+                # now would lay out the whole window again for every row)
+                self.subtitles_to_fit.append((row, box, subtitle_label, variable is not None))
 
         if variable is not None:
             switch = self.register(ToggleSwitch(row, "", variable), surface="card")
@@ -3700,7 +4069,9 @@ class AutoClicker:
         the whole title, and a reasonable width for grey text (which can wrap)."""
         parts = row.parts
         title = parts["title"]
-        width = tkfont.Font(font=title.cget("font") or "TkDefaultFont").measure(title.cget("text"))
+        # (measured with the label's own font: making a new font object for it is slow)
+        width = int(title.tk.call("font", "measure", title.cget("font") or "TkDefaultFont",
+                                  title.cget("text")))
         if parts["subtitle"] is not None:
             width = max(width, 140)
         return min(ROW_WORDS_MIN, width + 12)
@@ -3853,15 +4224,17 @@ class AutoClicker:
         ttk.Label(sub, text="Saved profiles").grid(row=3, column=0, sticky="w", pady=(0, 4))
         load_row = ttk.Frame(sub)
         load_row.grid(row=4, column=0, sticky="ew")
-        load_row.columnconfigure(0, weight=1)
         self.profile_combo = self.make_combo(load_row, self.profile_choice, list_profiles())
         self.profile_combo.placeholder = "No profiles yet"
-        self.profile_combo.grid(row=0, column=0, sticky="ew")
-        self.make_button(load_row, "Load", self.load_profile, height=FIELD_HEIGHT, width=90).grid(
-            row=0, column=1, padx=(10, 0))
-        self.delete_btn = self.make_button(load_row, "Delete", self.delete_profile,
-                                           height=FIELD_HEIGHT, width=90)
-        self.delete_btn.grid(row=0, column=2, padx=(10, 0))
+        self.profile_combo.grid(row=0, column=0, columnspan=4, sticky="ew")
+        actions = [("Load", self.load_profile), ("Rename", self.rename_profile),
+                   ("Duplicate", self.duplicate_profile), ("Delete", self.delete_profile)]
+        for column, (text, command) in enumerate(actions):
+            load_row.columnconfigure(column, weight=1, uniform="profile_buttons")
+            button = self.make_button(load_row, text, command, height=FIELD_HEIGHT, width=70)
+            button.grid(row=1, column=column, sticky="ew", pady=(8, 0),
+                        padx=(0 if column == 0 else 5, 0 if column == 3 else 5))
+        self.delete_btn = button
 
         card = self.card_section(sub, 5)
         self.card_row(card, "Hotkey",
@@ -3903,12 +4276,24 @@ class AutoClicker:
         self.card_row(card, "Record mouse movement", self.record_moves,
                       subtitle="When off, clicks are kept, but not the movement in between",
                       show=lambda: not self.record_keys_only.get())
+        self.card_row(card, "Accuracy",
+                      subtitle="How smoothly mouse movement is recorded. Higher is smoother "
+                               "but makes bigger profiles",
+                      value=lambda p: self.make_combo(p, self.record_accuracy, list(ACCURACY),
+                                                      width=KEY_FIELD_WIDTH, max_items=4),
+                      show=lambda: not self.record_keys_only.get() and self.record_moves.get())
+        self.card_row(card, "Keep quick repeats", self.record_repeats,
+                      subtitle="When off, the same key or button pressed twice within "
+                               f"{self.QUICK_REPEAT:g} seconds is only recorded once")
 
         card = self.card_section(sub, 13, "Playing it back")
         self.card_row(card, "Loop", self.replay_loop, subtitle="Keep playing until you stop it")
         self.card_row(card, "Stop after a number of plays", self.replay_limit_on,
                       value=lambda p: self.make_spin(p, self.replay_limit, 1, 100000, 1),
                       value_show=self.replay_limit_on.get, show=self.replay_loop.get)
+        self.card_row(card, "Speed", subtitle="2 plays it twice as fast, 0.5 at half speed",
+                      value=lambda p: self.make_spin(p, self.replay_speed, SPEED_MIN,
+                                                     SPEED_MAX, 0.25))
 
         self.replay_btn = self.make_button(frame, "", self.toggle, height=42, selectable=True,
                                            accent=True)
@@ -4105,6 +4490,8 @@ class AutoClicker:
         self.card_row(card, "Keep window on top", self.on_top)
         self.card_row(card, "Auto stop", self.auto_stop,
                       subtitle="Stop when you move or click the mouse yourself")
+        self.card_row(card, "Start countdown", self.countdown,
+                      subtitle="Count down the start delay (3, 2, 1) on the badge and here")
         self.card_row(card, "Sound when finished", self.finish_sound,
                       subtitle="When a limit is reached or a replay ends")
 
@@ -4421,8 +4808,15 @@ class AutoClicker:
         s = self.settings
         title = s.get("title", "Running")
         if not self.running.is_set():
-            title = f"Starting in {s['delay']:g}s"
+            title = self.starting_text()
         return True, title, s.get("details", "")
+
+    def starting_text(self):
+        """During the start delay: "Starting in 3" counting down (or "Starting in 5s")."""
+        if self.countdown.get():
+            left = max(1, math.ceil(self.begin_at - time.monotonic() - 0.001))
+            return f"Starting in {left}"
+        return f"Starting in {self.settings.get('delay', 0):g}s"
 
     def describe_run(self, label=None):
         """The floating card's title and details for what's about to run."""
@@ -4437,6 +4831,8 @@ class AutoClicker:
             title = f"Playing {label or self.recording_name or 'unsaved recording'}"
             n = len(s["actions"])
             parts = [f"{n} {'action' if n == 1 else 'actions'}", plays]
+            if s["speed"] != 1:
+                parts.append(f"{s['speed']:g}x speed")
         elif s["mode"] == "keyboard":
             key = input_name(self.kb_key.get())
             title = f"Holding {key}" if s["hold"] else f"Pressing {key}"
@@ -4498,6 +4894,13 @@ class AutoClicker:
         elif self.badge is not None:
             self.badge.destroy()
             self.badge = None
+
+    def warn_wayland(self):
+        SmallDialog(self.root, "Wayland session",
+                    "You're using a Wayland session, where Auto Clicker can't click or press "
+                    "keys in most apps.\n\nTo use it, log out, click the gear icon at the "
+                    "bottom right of the login screen, choose the option with \"Xorg\" in its "
+                    "name, then log in again.", self.palette)
 
     def show_window(self):
         self.root.deiconify()
@@ -4672,6 +5075,7 @@ class AutoClicker:
                 "badge_show": self.badge_show.get(),
                 "badge_corner": self.badge_corner.get(),
                 "finish_sound": bool(self.finish_sound.get()),
+                "countdown": bool(self.countdown.get()),
                 "text_size": self.text_size.get(),
                 "sidebar_width": self.sidebar_width,
                 "bar_height": self.bar_height,
@@ -4705,7 +5109,8 @@ class AutoClicker:
             "auto_stop": self.auto_stop, "always_on_top": self.on_top, "mini_mode": self.mini,
             "badge_show": self.badge_show, "badge_corner": self.badge_corner,
             "sidebar_side": self.sidebar_side,
-            "finish_sound": self.finish_sound, "text_size": self.text_size,
+            "finish_sound": self.finish_sound, "countdown": self.countdown,
+            "text_size": self.text_size,
             "dark_mode": self.dark, "accent": self.accent,
         })
         for name, var in variables.items():
@@ -4814,6 +5219,78 @@ class AutoClicker:
         self.refresh_recording_info()
         self.save_current_recording()
         self.status.config(text=f"Loaded {name}")
+
+    def chosen_profile(self):
+        """The profile picked in the list, or None (with a message) if there isn't one."""
+        name = self.profile_choice.get()
+        if not name or not profile_path(name).exists():
+            self.status.config(text="Pick a profile first")
+            self.refresh_profile_list()
+            return None
+        return name
+
+    def check_new_name(self, typed, old=None):
+        """(name, problem): the profile name to use, or why it can't be used."""
+        name = safe_profile_name(typed or "")
+        if not name:
+            return None, "Type a name first."
+        taken = [n for n in list_profiles() if n.lower() == name.lower() and n != old]
+        if taken:
+            return None, f"There's already a profile called {taken[0]}."
+        return name, None
+
+    def rename_profile(self):
+        old = self.chosen_profile()
+        if old is None:
+            return
+
+        def ok(typed):
+            new, problem = self.check_new_name(typed, old)
+            if problem:
+                return problem
+            if new == old:
+                return None
+            ok_read, recording = read_profile(old)
+            if not ok_read or not write_profile(new, recording, read_profile_hotkey(old)):
+                return f"Couldn't rename {old}."
+            if new.lower() != old.lower():  # (same file if only the capitals changed)
+                try:
+                    profile_path(old).unlink()
+                except OSError:
+                    pass
+            if self.recording_name == old:
+                self.recording_name = new
+                self.save_current_recording()
+                self.refresh_recording_info()
+            self.refresh_profile_list(select=new)
+            self.status.config(text=f"Renamed {old} to {new}")
+            return None
+
+        SmallDialog(self.root, "Rename profile", f"New name for {old}:", self.palette,
+                    ok_text="Rename", name=old, ok=ok)
+
+    def duplicate_profile(self):
+        old = self.chosen_profile()
+        if old is None:
+            return
+        suggestion, n = f"{old} copy", 2
+        while profile_path(suggestion).exists():
+            suggestion, n = f"{old} copy {n}", n + 1
+
+        def ok(typed):
+            new, problem = self.check_new_name(typed)
+            if problem:
+                return problem
+            ok_read, recording = read_profile(old)
+            # the copy has no hotkey: one key can only play one profile
+            if not ok_read or not write_profile(new, recording, None):
+                return f"Couldn't copy {old}."
+            self.refresh_profile_list(select=new)
+            self.status.config(text=f"Copied {old} to {new}")
+            return None
+
+        SmallDialog(self.root, "Duplicate profile", f"Name for the copy of {old}:",
+                    self.palette, ok_text="Duplicate", name=suggestion, ok=ok)
 
     def delete_profile(self):
         name = self.profile_choice.get()
@@ -4981,6 +5458,10 @@ class AutoClicker:
         self.record_from_button = from_button
         self.recording_buf = []
         self.record_pressed = set()
+        self.record_skipped = set()
+        self.record_last_press = {}
+        self.record_keep_repeats = bool(self.record_repeats.get())
+        self.move_sample = ACCURACY.get(self.record_accuracy.get(), ACCURACY["High"])
         with self.motion_lock:
             self.record_last_move = 0.0
             self.record_dx = self.record_dy = 0.0
@@ -5079,7 +5560,7 @@ class AutoClicker:
 
     def note_motion(self, x=None, y=None, dx=0.0, dy=0.0):
         """The pointer moved to x, y, and/or the mouse moved dx, dy (from RawMotion).
-        Recorded as a "move" at most every MOVE_SAMPLE seconds."""
+        Recorded as a "move" at most every move_sample seconds (see ACCURACY)."""
         if not (self.recording_active and self.record_movement):
             return
         with self.motion_lock:
@@ -5088,12 +5569,12 @@ class AutoClicker:
             self.record_dx += dx
             self.record_dy += dy
             self.record_moved = True
-            if time.monotonic() - self.record_last_move >= self.MOVE_SAMPLE:
+            if time.monotonic() - self.record_last_move >= self.move_sample:
                 self.flush_motion()
 
     def flush_motion_later(self):
         """RawMotion's idle check: record movement that's been waiting long enough."""
-        if self.record_moved and time.monotonic() - self.record_last_move >= self.MOVE_SAMPLE:
+        if self.record_moved and time.monotonic() - self.record_last_move >= self.move_sample:
             self.flush_motion()
 
     def flush_motion(self):
@@ -5131,8 +5612,10 @@ class AutoClicker:
                     plays = max(1, int(self.replay_limit.get()))
                 else:
                     plays = 0  # forever
+                speed = min(max(float(self.replay_speed.get()), SPEED_MIN), SPEED_MAX)
                 self.settings = {
                     "mode": "replay", "hold": False, "actions": actions, "plays": plays,
+                    "speed": speed,
                     "label": label, "limit": 0, "time_limit": 0,
                     "delay": 0.0, "locations": None, "codes": set(),
                 }
@@ -5245,7 +5728,8 @@ class AutoClicker:
         self.refresh_button()
         delay = self.settings["delay"]
         if delay > 0:
-            self.status.config(text=f"Starting in {delay:g}s...")
+            self.begin_at = time.monotonic() + delay
+            self.status.config(text=self.starting_text() + "...")
             self.root.after(int(delay * 1000), self.begin_clicking)
         else:
             self.begin_clicking()
@@ -5335,7 +5819,7 @@ class AutoClicker:
             began = time.monotonic()
             self.replay_pos = None
             for action in s["actions"]:
-                wait = began + action[0] - time.monotonic()
+                wait = began + action[0] / s["speed"] - time.monotonic()
                 if wait > 0 and self.stopped.wait(wait):
                     return  # stopped
                 if not self.running.is_set():
@@ -5441,25 +5925,46 @@ class AutoClicker:
         if self.is_synthetic(code):
             return  # one of our own key presses
         if self.recording_active and code and code not in self.record_exclude:
-            if code not in self.record_pressed:  # skip key repeat while held
-                self.record_pressed.add(code)
-                self.record_event("kpress", code)
+            # (skip key repeat while it's held down)
+            if code not in self.record_pressed and code not in self.record_skipped:
+                if self.quick_repeat(code):
+                    self.record_skipped.add(code)
+                else:
+                    self.record_pressed.add(code)
+                    self.record_event("kpress", code)
         self.events.put(("input", code, time.monotonic()))
 
     def on_key_release(self, key):
         code = input_code(key)
-        if self.recording_active and code in self.record_pressed:
+        if code in self.record_skipped:
+            self.record_skipped.discard(code)  # its press was left out, so leave this out too
+        elif self.recording_active and code in self.record_pressed:
             self.record_pressed.discard(code)
             self.record_event("krelease", code)
         if self.capturing is not None and code in MODIFIER_OF:
             self.events.put(("release", code, time.monotonic()))
 
+    def quick_repeat(self, code):
+        """While recording: True if this press should be left out, because the same key or
+        button was pressed very shortly before (unless "Keep quick repeats" is on)."""
+        now = time.monotonic()
+        last = self.record_last_press.get(code)
+        if not self.record_keep_repeats and last is not None and now - last < self.QUICK_REPEAT:
+            return True
+        self.record_last_press[code] = now
+        return False
+
     def on_mouse(self, x, y, button, pressed):
         code = input_code(button)
         if self.recording_active and not self.record_keys and code not in self.record_exclude:
             if pressed:
-                self.record_pressed.add(code)
-                self.record_event("press", code, int(x), int(y))
+                if self.quick_repeat(code):
+                    self.record_skipped.add(code)
+                else:
+                    self.record_pressed.add(code)
+                    self.record_event("press", code, int(x), int(y))
+            elif code in self.record_skipped:
+                self.record_skipped.discard(code)
             elif code in self.record_pressed:
                 self.record_pressed.discard(code)
                 self.record_event("release", code, int(x), int(y))
@@ -5550,8 +6055,13 @@ class AutoClicker:
                     self.handle_input(event[1], event[2])
         except queue.Empty:
             pass
-        # Keep the floating card's progress (count, time left) up to date
-        if (self.badge is not None and self.badge.showing and self.progress_text()
+        # Keep the floating card's progress (count, time left, countdown) up to date
+        counting = self.armed and not self.running.is_set() and self.countdown.get()
+        if counting:
+            text = self.starting_text() + "..."
+            if self.status.cget("text") != text:
+                self.status.config(text=text)
+        if (self.badge is not None and self.badge.showing and (self.progress_text() or counting)
                 and time.monotonic() - self.last_badge_update >= 0.25):
             self.last_badge_update = time.monotonic()
             self.refresh_running()
@@ -5576,7 +6086,21 @@ class AutoClicker:
         self.mouse_listener.stop()
         if self.theme_watcher is not None:
             self.theme_watcher.terminate()
-        self.root.destroy()
+        # Taking hundreds of widgets apart takes Tk a second or two, so vanish first...
+        for window in [self.root] + [w for w in self.root.winfo_children()
+                                      if isinstance(w, tk.Toplevel)]:
+            try:
+                window.withdraw()
+            except tk.TclError:
+                pass
+        self.root.update_idletasks()
+        self.root.update()  # (sends the "hide" to the screen now)
+        if self.quick_exit:
+            # ...and then don't take them apart at all: everything is saved and stopped, so
+            # main() just ends the program (the system clears the window away instantly)
+            self.root.quit()
+        else:
+            self.root.destroy()
 
 
 def main():
@@ -5584,7 +6108,19 @@ def main():
         write_icons()
         return
     found = resolve_locations()  # where settings and profiles are (and if they were moved)
+    # Don't connect to the input method (ibus): it's only for typing languages like Chinese,
+    # and when it's busy or stuck it makes the app take many seconds to open
+    modifiers = os.environ.get("XMODIFIERS")
+    os.environ["XMODIFIERS"] = "@im=none"
     root = tk.Tk(className=APP_CLASS)  # window class the dock uses to find the app entry
+    if modifiers is None:  # (put it back for anything the app opens, like the file manager)
+        os.environ.pop("XMODIFIERS", None)
+    else:
+        os.environ["XMODIFIERS"] = modifiers
+    try:
+        root.tk.call("tk", "useinputmethods", 0)
+    except tk.TclError:
+        pass
     app = AutoClicker(root)
     if found:
         app.status.config(text="Found your moved " + " and ".join(found)
@@ -5592,7 +6128,12 @@ def main():
     # When something asks the app to quit (like install.sh updating it), close it the same
     # way as the window's close button: settings are saved and nothing is left held down.
     signal.signal(signal.SIGTERM, lambda *_: root.after(0, app.on_close))
+    app.quick_exit = True
     root.mainloop()
+    if app.shutdown.is_set():  # closed properly (settings saved, nothing held down)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":

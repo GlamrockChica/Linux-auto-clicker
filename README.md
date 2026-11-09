@@ -9,13 +9,16 @@ and can record and replay what you do.
   button, single/double/triple clicks, hold the button down, click at a set spot or at
   several spots in turn
 - **Keyboard clicker:** presses a key or key combo (like Ctrl+C) over and over, or holds it
-- **Record and replay:** record your mouse and keyboard, replay it once, a set number of
-  times or on a loop, and save recordings as profiles with their own hotkey. Mouse
+- **Record and replay:** record your mouse and keyboard (with a choice of how smoothly mouse
+  movement is recorded, from Lowest to Ultra), replay it once, a set number of
+  times or on a loop, at any speed (half speed, twice as fast...), and save recordings as
+  profiles with their own hotkey (rename, duplicate or share them as text files). Mouse
   movement replays properly in games that lock the mouse (like first-person Roblox),
   so the camera turns the same way it did when you recorded
 - **Stops by itself** after a number of clicks or a set time, or when you move the mouse
 - **Mini mode:** a small rounded panel that stays on top of other windows
-- **Badge:** a small card in the corner of the screen showing what's running
+- **Badge:** a small card in the corner of the screen showing what's running, and
+  counting down the start delay (3, 2, 1)
 - Light and dark mode, accent colours, text sizes, and a menu you can move to any side
 
 ## Requirements
