@@ -4,7 +4,7 @@ set -e
 cd "$(dirname "$0")"
 
 APP="$HOME/.local/bin/autoclicker"
-# How to spot a running Auto Clicker: the installed app, or `python autoclicker.py`
+# How to spot a running Pengclick: the installed app, or `python autoclicker.py`
 RUNNING_APP="^$APP( |$)"
 # (only a process that *is* Python, never a shell that mentions it)
 RUNNING_SCRIPT="^[^ ]*python[0-9.]* ([^ ]*/)?autoclicker\.py( |$)"
@@ -15,7 +15,7 @@ is_running() {
 
 close_app() {
     is_running || return 0
-    echo "Closing Auto Clicker..."
+    echo "Closing Pengclick..."
     # Ask nicely first: the app saves its settings and lets go of anything held down
     pkill -TERM -f "$RUNNING_APP" || true
     pkill -TERM -f "$RUNNING_SCRIPT" || true
@@ -61,8 +61,8 @@ echo "Creating menu entry..."
 cat > "$HOME/.local/share/applications/autoclicker.desktop" << DESKTOP
 [Desktop Entry]
 Type=Application
-Name=Auto Clicker
-Comment=Simple auto clicker
+Name=Pengclick
+Comment=A simple auto clicker for Linux
 Exec=$APP
 Icon=autoclicker
 StartupWMClass=Autoclicker
@@ -73,7 +73,7 @@ DESKTOP
 chmod +x "$HOME/.local/share/applications/autoclicker.desktop"
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 
-echo "Starting Auto Clicker..."
+echo "Starting Pengclick..."
 # Start it from the menu entry (so the dock shows it properly), or directly if that
 # doesn't work. Either way it keeps running after this terminal closes.
 if ! (command -v gtk-launch >/dev/null && gtk-launch autoclicker >/dev/null 2>&1); then
@@ -81,4 +81,4 @@ if ! (command -v gtk-launch >/dev/null && gtk-launch autoclicker >/dev/null 2>&1
 fi
 
 echo
-echo "Done! Auto Clicker has been updated and started."
+echo "Done! Pengclick has been updated and started."

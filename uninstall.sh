@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Removes Auto Clicker from this computer. Your settings, profiles, areas and macros are kept unless you
+# Removes Pengclick from this computer. Your settings, profiles, areas and macros are kept unless you
 # answer "y" when asked at the end.
 set -e
 
@@ -8,7 +8,7 @@ CONFIG="$HOME/.config/autoclicker"
 
 # Close the app if it's running (it saves its settings and lets go of anything held down)
 if pgrep -f "^$APP( |$)" >/dev/null; then
-    echo "Closing Auto Clicker..."
+    echo "Closing Pengclick..."
     pkill -TERM -f "^$APP( |$)" || true
     for _ in $(seq 1 50); do  # wait up to 5 seconds
         pgrep -f "^$APP( |$)" >/dev/null || break
@@ -21,7 +21,7 @@ echo "Removing the app, its menu entry and its icons..."
 rm -f "$APP" "$HOME/.local/share/applications/autoclicker.desktop"
 find "$HOME/.local/share/icons" -name 'autoclicker*.png' -delete 2>/dev/null || true
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
-echo "Auto Clicker has been removed."
+echo "Pengclick has been removed."
 echo
 
 # Where the settings, profiles, areas and macros are (they can be moved from inside the app)
@@ -58,7 +58,7 @@ if [[ "$answer" =~ ^[Yy] ]]; then
             rm -rf -- "$dir"
             echo "Deleted $dir"
         elif [ -d "$dir" ]; then
-            echo "Left $dir alone (it doesn't look like an Auto Clicker folder)"
+            echo "Left $dir alone (it doesn't look like a Pengclick folder)"
         fi
     done
     rm -f "$CONFIG/locations.json"

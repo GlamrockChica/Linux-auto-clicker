@@ -1,6 +1,6 @@
-# Auto Clicker
+# Pengclick
 
-A simple, good-looking auto clicker for Linux. It clicks the mouse or presses a key for you,
+A simple, good-looking auto clicker for Linux, with a penguin. It clicks the mouse or presses a key for you,
 and can record and replay what you do.
 
 ## Features
@@ -62,7 +62,7 @@ cd Linux-auto-clicker && ./install.sh
 (Or download the zip from GitHub, unzip it, open a terminal in the folder and run
 `./install.sh`.)
 
-The installer builds the app, adds **Auto Clicker** to your app list and starts it.
+The installer builds the app, adds **Pengclick** to your app list and starts it.
 It needs an internet connection the first time, to download its two Python packages
 (`pynput` and `pyinstaller`).
 

@@ -1,5 +1,5 @@
 """
-Auto Clicker (GUI) with sidebar, smooth dark mode, rounded widgets, accent colours
+Pengclick: an auto clicker (GUI) with sidebar, smooth dark mode, rounded widgets, accent colours
 and saved settings
 Requires: pynput, and python3-tk on Linux
 Settings file: ~/.config/autoclicker/settings.json
@@ -94,7 +94,7 @@ PROFILES_MARKER = ".autoclicker-profiles"
 AREAS_MARKER = ".autoclicker-areas"
 MACROS_MARKER = ".autoclicker-macros"
 
-APP_VERSION = "3.2"  # bump this for each GitHub release, and tag the release "v" + this
+APP_VERSION = "3.3"  # bump this for each GitHub release, and tag the release "v" + this
 GITHUB_REPO = "GlamrockChica/Linux-auto-clicker"
 GITHUB_PAGE = f"https://github.com/{GITHUB_REPO}"
 APP_CLASS = "autoclicker"  # window class; install.sh sets StartupWMClass to match
@@ -526,7 +526,7 @@ def latest_release():
     import urllib.request
     request = urllib.request.Request(
         f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-        headers={"User-Agent": "Auto-Clicker-update-check",
+        headers={"User-Agent": "Pengclick-update-check",
                  "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(request, timeout=8) as reply:
         data = json.load(reply)
@@ -984,7 +984,7 @@ def mark_folder(folder: Path, marker: str, what: str) -> None:
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / marker
         if not path.exists():
-            path.write_text(f"This folder holds Auto Clicker's {what}. You can move it: the "
+            path.write_text(f"This folder holds Pengclick's {what}. You can move it: the "
                             "app will find it again.\n", encoding="utf-8")
     except OSError:
         pass
@@ -2269,15 +2269,16 @@ def over(top, rgb, covered):
 
 class Logo(tk.Canvas):
     """The app's logo for the top of the sidebar: the penguin with its cursor, in the
-    accent colour, and the name stacked next to it."""
+    accent colour, and the app's name next to it."""
 
+    NAME = "Pengclick"
     ICON = 42  # icon size in pixels
     GAP = 8    # space between icon and name
 
     def __init__(self, parent, font):
         f = tkfont.Font(font=font)
         height = max(self.ICON, f.metrics("linespace") * 2)
-        width = self.ICON + self.GAP + max(f.measure("Auto"), f.measure("Clicker")) + 4
+        width = self.ICON + self.GAP + f.measure(self.NAME) + 4
         super().__init__(parent, width=width, height=height, highlightthickness=0, bd=0)
         self.font = font
         self.palette = None
@@ -2297,7 +2298,7 @@ class Logo(tk.Canvas):
         """The text size changed: fit the logo to it again."""
         f = tkfont.Font(font=self.font)
         self.configure(height=max(self.ICON, f.metrics("linespace") * 2),
-                       width=self.ICON + self.GAP + max(f.measure("Auto"), f.measure("Clicker")) + 4)
+                       width=self.ICON + self.GAP + f.measure(self.NAME) + 4)
         self.redraw()
 
     def redraw(self):
@@ -2322,8 +2323,7 @@ class Logo(tk.Canvas):
         h = self.winfo_height()
         self.create_image(0, (h - self.ICON) // 2, image=self.image, anchor="nw")
         x = self.ICON + self.GAP
-        self.create_text(x, h / 2, text="Auto", anchor="sw", fill=p["fg"], font=self.font)
-        self.create_text(x, h / 2, text="Clicker", anchor="nw", fill=p["fg"], font=self.font)
+        self.create_text(x, h / 2, text=self.NAME, anchor="w", fill=p["fg"], font=self.font)
 
 
 _corner_cache = {}
@@ -4969,7 +4969,7 @@ class AutoClicker:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Auto Clicker")
+        self.root.title("Pengclick")
         self.root.geometry(WINDOW_SIZE)
         self.root.minsize(*MIN_SIZE)
         # See-through while it's laid out, so it appears all at once (see reveal). Tk can
@@ -6290,7 +6290,7 @@ class AutoClicker:
 
         card = self.card_section(sub, 10, "About")
         _, self.version_text, _ = self.card_row(
-            card, f"Auto Clicker v{APP_VERSION}", subtitle="",
+            card, f"Pengclick v{APP_VERSION}", subtitle="",
             value=lambda p: self.button_group(p, [("GitHub page", self.open_github, 100)]))
         self.card_row(card, "Check for updates", self.check_updates,
                       subtitle="Looks on GitHub for a newer version when the app opens",
@@ -6453,7 +6453,7 @@ class AutoClicker:
         """A short "done" sound when a run finishes by itself (not when you stop it)."""
         if not self.finish_sound.get():
             return
-        attempts = (["canberra-gtk-play", "-i", "complete", "-d", "Auto Clicker"],
+        attempts = (["canberra-gtk-play", "-i", "complete", "-d", "Pengclick"],
                     ["pw-play", "/usr/share/sounds/freedesktop/stereo/complete.oga"])
         for command in attempts:
             if shutil.which(command[0]):
@@ -6714,7 +6714,7 @@ class AutoClicker:
 
     def warn_wayland(self):
         SmallDialog(self.root, "Wayland session",
-                    "You're using a Wayland session, where Auto Clicker can't click or press "
+                    "You're using a Wayland session, where Pengclick can't click or press "
                     "keys in most apps.\n\nTo use it, log out, click the gear icon at the "
                     "bottom right of the login screen, choose the option with \"Xorg\" in its "
                     "name, then log in again.", self.palette)
@@ -7234,10 +7234,10 @@ class AutoClicker:
         if (chosen / marker).exists() or empty or not chosen.exists():
             target = chosen
         else:
-            target = chosen / {"settings": "Auto Clicker settings",
-                               "profiles": "Auto Clicker profiles",
-                               "areas": "Auto Clicker areas",
-                               "macros": "Auto Clicker macros"}[kind]
+            target = chosen / {"settings": "Pengclick settings",
+                               "profiles": "Pengclick profiles",
+                               "areas": "Pengclick areas",
+                               "macros": "Pengclick macros"}[kind]
         if target.resolve() == current.resolve():
             self.status.config(text="It's already there")
             return
@@ -8115,7 +8115,7 @@ class AutoClicker:
                 self.keyboard.release(key)
         elif s["mode"] == "macro":  # the macro's clicks, one after another
             button, x, y = s["macro"][self.clicks % len(s["macro"])]
-            if not self.on_own_window((x, y)):  # (never click the auto clicker itself)
+            if not self.on_own_window((x, y)):  # (never click Pengclick itself)
                 self.click_spot(s, (x, y), button)
         elif s.get("area"):  # every spot in the area, one after another
             spot = s["area"].point(self.clicks)
