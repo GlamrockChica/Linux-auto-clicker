@@ -44,7 +44,12 @@ echo "Making the app icon..."
 python autoclicker.py --write-icons
 
 echo "Building app..."
-pyinstaller --onefile --windowed --name autoclicker autoclicker.py
+# (leaving out parts of Python the app never uses keeps the program smaller)
+UNUSED="asyncio multiprocessing concurrent evdev decimal _pydecimal tarfile unittest pydoc
+        pydoc_data xml xmlrpc difflib statistics fractions csv argparse"
+EXCLUDES=()
+for module in $UNUSED; do EXCLUDES+=(--exclude-module "$module"); done
+pyinstaller --onefile --windowed --name autoclicker "${EXCLUDES[@]}" autoclicker.py
 
 echo "Installing to ~/.local/bin..."
 mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"

@@ -1,0 +1,12 @@
+# Made by install.sh / build.sh when building the app
+.venv/
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Your own recordings (profiles), saved areas and saved macros, if they're kept in this folder
+profiles/
+areas/
+macros/

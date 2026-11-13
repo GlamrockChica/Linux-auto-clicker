@@ -14,6 +14,7 @@ import queue
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -74,23 +75,34 @@ BLOCKED_KEYS = {"key:esc", "key:tab", "key:cmd", "key:cmd_l", "key:cmd_r"}
 SETTINGS_PATH = Path.home() / ".config" / "autoclicker" / "settings.json"
 # Profiles are .txt files in a "profiles" folder, next to the settings unless it's moved
 PROFILES_DIR = Path.home() / ".config" / "autoclicker" / "profiles"
+# Saved areas (see AreaPlan) are .txt files in an "areas" folder, the same way
+AREAS_DIR = Path.home() / ".config" / "autoclicker" / "areas"
+# Saved macros (.txt files), see read_macro
+MACROS_DIR = Path.home() / ".config" / "autoclicker" / "macros"
 
-# Both folders can be moved (Settings > Storage, or by hand). This file never moves and
+# All three folders can be moved (Settings > Storage, or by hand). This file never moves and
 # remembers where they are; each folder also holds a small hidden marker file, so if you
 # move a folder yourself the app can find it again.
 CONFIG_DIR = Path.home() / ".config" / "autoclicker"
 POINTER_PATH = CONFIG_DIR / "locations.json"
 DEFAULT_SETTINGS_DIR = CONFIG_DIR
 DEFAULT_PROFILES_DIR = PROFILES_DIR
+DEFAULT_AREAS_DIR = AREAS_DIR
+DEFAULT_MACROS_DIR = MACROS_DIR
 SETTINGS_MARKER = ".autoclicker-settings"
 PROFILES_MARKER = ".autoclicker-profiles"
+AREAS_MARKER = ".autoclicker-areas"
+MACROS_MARKER = ".autoclicker-macros"
 
+APP_VERSION = "3.2"  # bump this for each GitHub release, and tag the release "v" + this
+GITHUB_REPO = "GlamrockChica/Linux-auto-clicker"
+GITHUB_PAGE = f"https://github.com/{GITHUB_REPO}"
 APP_CLASS = "autoclicker"  # window class; install.sh sets StartupWMClass to match
 # Dock / app list icon: the sidebar logo (cursor on a rounded square) in black and white,
 # matching the computer's light/dark mode. install.sh saves it as PNGs (see write_icons).
-ICON_STYLES = {  # style: (square colour, cursor colour)
-    "light": ("#d9d9d9", "#1a1a1a"),  # computer in light mode: light grey, dark cursor
-    "dark": ("#333333", "#f2f2f2"),   # computer in dark mode: dark grey, light cursor
+ICON_STYLES = {  # style: the penguin's colour (see logo_gradient)
+    "light": "#8a4dff",  # computer in light mode
+    "dark": "#8a4dff",   # computer in dark mode (the same: it shows well on both)
 }
 ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
 ICONS_HOME = Path.home() / ".local" / "share" / "icons"  # your own icons
@@ -110,7 +122,20 @@ DEFAULTS = {
     "location_on": False,      # click at saved spots instead of wherever the mouse is
     "locations": None,         # [[x, y], ...] - one spot, or several clicked in turn
     "multi_location": False,   # several spots in a row (F7 / Pick add a spot)
+    "area_on": False,          # click every spot inside the area's shapes
+    "area": [],                # the shapes to click inside (see AreaPlan)
+    "area_gap": 10,            # pixels between the spots it clicks
+    "area_return": True,       # put the mouse back after each area click
+    "area_in_order": False,    # click one shape's spots, then the next shape's (see AreaPlan)
     "hold": False,             # hold the button down instead of clicking
+    # macros
+    "macro": [],               # the clicks, in order: {"button": "Left", "x": 10, "y": 20}
+    "macro_wait": 0.5,         # seconds between its clicks
+    "macro_delay": 0.0,        # start delay
+    "macro_loop": True,        # play it over and over
+    "macro_limit_on": False,   # ...but stop after a set number of plays
+    "macro_limit": 5,
+    "macro_return": True,      # put the mouse back after each click
     # keyboard clicker
     "kb_key": "char:w",        # a key, or a combo like "ctrl+shift+char:c"
     "kb_cps": 10.0,
@@ -136,6 +161,7 @@ DEFAULTS = {
     "hotkey": "key:f6",        # starts / stops clicking
     "location_key": "key:f7",  # saves the mouse position as the click spot
     "record_key": "key:f8",    # starts / stops recording
+    "draw_key": "key:f9",      # opens the menu for drawing an area's shapes
     "auto_stop": False,        # stop if you move or click the mouse yourself
     "always_on_top": False,
     "mini_mode": False,        # a small window with just the mouse clicker
@@ -144,6 +170,7 @@ DEFAULTS = {
     "badge_corner": "Top left",     # which corner of the screen it sits in
     "finish_sound": True,      # play a sound when a run finishes by itself
     "countdown": True,         # count down the start delay (3, 2, 1) on the badge
+    "check_updates": True,     # look for a newer version on GitHub when the app starts
     "text_size": "Normal",     # Small / Normal / Large
     "dark_mode": False,
     "accent": "#4a8fd9",
@@ -154,11 +181,16 @@ DEFAULTS = {
 
 # Which clicker each page runs: the start/stop key runs the clicker of the page you're
 # on (on Settings, the last one you used)
-MODE_PAGES = {"mouse": "clicker", "keyboard": "keyboard", "replay": "recording"}
+MAX_CPS = 1000  # fastest clicks / key presses per second you can set
+
+
+MODE_PAGES = {"mouse": "clicker", "macro": "macros", "keyboard": "keyboard",
+              "replay": "recording"}
 PAGE_MODES = {page: mode for mode, page in MODE_PAGES.items()}
+PAGE_MODES["areas"] = "mouse"  # the Areas page sets up the mouse clicker
 
 # The app's own keys (Settings page); they must all be different
-APP_KEYS = ("hotkey", "location_key", "record_key")
+APP_KEYS = ("hotkey", "location_key", "record_key", "draw_key")
 
 # Preset accent colours shown as squares in Settings (the last square is "custom")
 ACCENTS = (
@@ -371,6 +403,13 @@ def clean_settings(saved, base=None) -> dict:
             settings["locations"] = spots or None
         elif is_point(saved.get("location")):  # older versions had a single spot
             settings["locations"] = [[int(v) for v in saved["location"]]]
+        area = saved.get("area")
+        if (isinstance(area, list) and len(area) == 4
+                and all(isinstance(v, (int, float)) for v in area)):  # older: one box
+            x, y, w, h = (int(v) for v in area)
+            area = [{"type": "rectangle", "points": [x, y, x + w, y + h]}]
+        settings["area"] = clean_shapes(area if isinstance(area, list) else [])
+        settings["macro"] = clean_macro(saved.get("macro"))
         if "recording" in saved:
             settings["recording"] = clean_recording(saved.get("recording"))
         # Older settings files used "limit": 0 to mean "never stop"
@@ -380,7 +419,7 @@ def clean_settings(saved, base=None) -> dict:
         for name in APP_KEYS:
             if re.fullmatch(r"F\d+", settings[name]):
                 settings[name] = "key:" + settings[name].lower()
-    for name in ("limit", "kb_limit", "replay_limit"):
+    for name in ("limit", "kb_limit", "replay_limit", "macro_limit"):
         if settings[name] < 1:
             settings[name] = DEFAULTS[name]
     settings["sidebar_width"] = min(max(settings["sidebar_width"], SIDEBAR_MIN), SIDEBAR_MAX)
@@ -389,6 +428,9 @@ def clean_settings(saved, base=None) -> dict:
         if settings[name] <= 0:
             settings[name] = DEFAULTS[name]
     settings["replay_speed"] = min(max(settings["replay_speed"], SPEED_MIN), SPEED_MAX)
+    settings["area_gap"] = min(max(settings["area_gap"], AREA_GAP_MIN), AREA_GAP_MAX)
+    settings["macro_wait"] = min(max(settings["macro_wait"], MACRO_WAIT_MIN), MACRO_WAIT_MAX)
+    settings["macro_delay"] = min(max(settings["macro_delay"], 0.0), 60.0)
     if settings["button"] not in BUTTONS:
         settings["button"] = DEFAULTS["button"]
     if settings["click_type"] not in CLICK_TYPES:
@@ -471,6 +513,24 @@ def read_recording(path: Path):
 
 
 SPEED_MIN, SPEED_MAX = 0.1, 10.0  # replay speed limits
+
+
+def version_numbers(text):
+    """(3, 1) for "v3.1" or "3.1"; None if there are no numbers in it."""
+    numbers = re.findall(r"\d+", text or "")
+    return tuple(int(n) for n in numbers) if numbers else None
+
+
+def latest_release():
+    """(tag, web page) of the newest release on GitHub. Raises an error if it can't tell."""
+    import urllib.request
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+        headers={"User-Agent": "Auto-Clicker-update-check",
+                 "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(request, timeout=8) as reply:
+        data = json.load(reply)
+    return data.get("tag_name", ""), data.get("html_url") or GITHUB_PAGE
 
 
 def on_wayland() -> bool:
@@ -609,6 +669,301 @@ def read_profile(name: str):
 HOTKEY_LINE = re.compile(r'^\{\s*hotkey\s*:\s*(".*")\s*\}$')
 
 
+# ---------------- Areas ----------------
+# An area is one or more shapes on the screen. The clicker clicks every spot inside them,
+# `gap` pixels apart, row by row. A shape is {"type": ..., "points": [x1, y1, x2, y2, ...]}:
+#   rectangle, circle: two opposite corners of the box it fills (a circle is an oval in it)
+#   triangle, polygon: its corners
+# Saved areas are .txt files in the areas folder (AREAS_DIR):
+#   {area:"farm"}
+#   {gap:"10"}
+#   {order:"1"}       (only if it clicks one shape after another, see AreaPlan)
+#   {rectangle:"812,440,1112,590"}
+#   {circle:"100,100,300,300"}
+#   {polygon:"10,10,80,20,60,90"}
+AREA_GAP_MIN, AREA_GAP_MAX = 1, 500
+AREA_LINE = re.compile(r'^\{\s*(\w+)\s*:\s*(".*")\s*\}$')
+SHAPE_NAMES = {"rectangle": "Rectangle", "circle": "Circle", "triangle": "Triangle",
+               "polygon": "Polygon"}
+
+
+def clean_shape(shape):
+    """A well-formed copy of a shape, or None if it isn't one."""
+    if not isinstance(shape, dict) or shape.get("type") not in SHAPE_NAMES:
+        return None
+    try:
+        points = [int(round(float(v))) for v in shape.get("points", [])]
+    except (TypeError, ValueError):
+        return None
+    kind = shape["type"]
+    if kind in ("rectangle", "circle"):
+        if len(points) != 4:
+            return None
+        x1, y1, x2, y2 = points
+        points = [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+        if points[2] - points[0] < 1 or points[3] - points[1] < 1:
+            return None
+    elif len(points) < 6 or len(points) % 2 or (kind == "triangle" and len(points) != 6):
+        return None
+    return {"type": kind, "points": points}
+
+
+def clean_shapes(shapes):
+    return [s for s in (clean_shape(x) for x in shapes or []) if s]
+
+
+def shape_corners(shape):
+    p = shape["points"]
+    return list(zip(p[0::2], p[1::2]))
+
+
+def shapes_box(shapes):
+    """(left, top, right, bottom) around all the shapes."""
+    xs = [x for s in shapes for x in s["points"][0::2]]
+    ys = [y for s in shapes for y in s["points"][1::2]]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def describe_shape(shape):
+    left, top, right, bottom = shapes_box([shape])
+    size = f"{right - left} × {bottom - top}"
+    if shape["type"] == "polygon":
+        return f"Polygon, {len(shape['points']) // 2} corners, {size} at {left}, {top}"
+    return f"{SHAPE_NAMES[shape['type']]}, {size} at {left}, {top}"
+
+
+def shape_spans(shape, y):
+    """Where a shape is along the row at height y: a list of (from x, to x)."""
+    p = shape["points"]
+    if shape["type"] == "rectangle":
+        return [(p[0], p[2])] if p[1] <= y <= p[3] else []
+    if shape["type"] == "circle":
+        cx, cy = (p[0] + p[2]) / 2, (p[1] + p[3]) / 2
+        rx, ry = (p[2] - p[0]) / 2, (p[3] - p[1]) / 2
+        d = (y - cy) / ry if ry else 2
+        if abs(d) > 1:
+            return []
+        half = rx * math.sqrt(1 - d * d)
+        return [(cx - half, cx + half)]
+    # triangle / polygon: where the row crosses its edges, paired up (inside between pairs)
+    corners = shape_corners(shape)
+    lowest = max(y for _x, y in corners)
+    if y == lowest:
+        y -= 1e-6  # (so the bottom row counts as inside, like a rectangle's does)
+    crossings = []
+    for (xa, ya), (xb, yb) in zip(corners, corners[1:] + corners[:1]):
+        if (ya <= y < yb) or (yb <= y < ya):
+            crossings.append(xa + (y - ya) * (xb - xa) / (yb - ya))
+    crossings.sort()
+    return list(zip(crossings[0::2], crossings[1::2]))
+
+
+def area_rows(shapes, gap):
+    """Every spot to click, row by row: [(y, [x, x, ...]), ...] (rows with no spots are left
+    out). The spots sit on a grid `gap` pixels apart, starting at the top-left of all the
+    shapes, so shapes next to each other line up and overlapping ones aren't clicked twice."""
+    from array import array
+    if not shapes:
+        return []
+    left, top, right, bottom = shapes_box(shapes)
+    rows = []
+    for y in range(top, bottom + 1, gap):
+        spans = sorted(span for shape in shapes for span in shape_spans(shape, y))
+        xs = array("i")
+        last = None
+        for a, b in spans:
+            first = left + math.ceil((a - left) / gap - 1e-9) * gap
+            if last is not None and first <= last:
+                first = last + gap  # (overlaps the span before: don't click spots twice)
+            end = math.floor(b + 1e-9)
+            if first <= end:
+                xs.extend(range(first, end + 1, gap))
+                last = xs[-1]
+        if xs:
+            rows.append((y, xs))
+    return rows
+
+
+class AreaPlan:
+    """The spots in an area and the order they're clicked in: along each row, then back
+    along the next (like mowing a lawn), so the mouse never jumps back across.
+    in_order: every spot in the first shape, then every spot in the next one, and so on
+    (in the order they were drawn), instead of all the shapes together row by row."""
+
+    def __init__(self, shapes, gap, in_order=False):
+        import bisect
+        self.bisect = bisect.bisect_right
+        self.parts = [AreaPlan([shape], gap) for shape in shapes] if in_order else []
+        self.rows = ([row for part in self.parts for row in part.rows] if in_order
+                     else area_rows(shapes, gap))
+        self.starts, total = [], 0
+        for item in self.parts or self.rows:
+            self.starts.append(total)
+            total += item.count if in_order else len(item[1])
+        self.count = total
+
+    def point(self, i):
+        i %= self.count
+        r = self.bisect(self.starts, i) - 1
+        if self.parts:  # one shape after another
+            return self.parts[r].point(i - self.starts[r])
+        y, xs = self.rows[r]
+        j = i - self.starts[r]
+        return (xs[-1 - j] if r % 2 else xs[j]), y
+
+
+def areas_dir() -> Path:
+    return AREAS_DIR
+
+
+def area_path(name: str) -> Path:
+    return areas_dir() / f"{name}.txt"
+
+
+def list_saved(folder: Path) -> list:
+    """The names of the .txt files in a folder (saved areas or macros), A to Z."""
+    try:
+        return sorted((p.stem for p in folder.glob("*.txt") if p.is_file()), key=str.lower)
+    except OSError:
+        return []
+
+
+def write_saved(path: Path, lines) -> bool:
+    """Write a saved area's or macro's lines (to a new file first, so a half-written file
+    never replaces a good one)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(path.name + ".tmp")
+        temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        temp.replace(path)
+        return True
+    except OSError as err:
+        print(f"Could not save {path.stem}: {err}")
+        return False
+
+
+def list_areas() -> list:
+    return list_saved(areas_dir())
+
+
+def write_area(name: str, shapes, gap: int, in_order=False) -> bool:
+    lines = ["{area:" + json.dumps(name) + "}", "{gap:" + json.dumps(str(int(gap))) + "}"]
+    if in_order:
+        lines.append('{order:"1"}')
+    for shape in shapes:
+        lines.append("{" + shape["type"] + ":"
+                     + json.dumps(",".join(str(v) for v in shape["points"])) + "}")
+    return write_saved(area_path(name), lines)
+
+
+def read_area(name: str):
+    """(shapes, gap, in order) from a saved area's file, or None if it can't be read or is
+    empty."""
+    shapes, gap, in_order = [], DEFAULTS["area_gap"], False
+    try:
+        lines = area_path(name).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        match = AREA_LINE.match(line.strip())
+        if not match:
+            continue
+        try:
+            key, value = match.group(1), json.loads(match.group(2))
+            if key == "gap":
+                gap = min(max(int(value), AREA_GAP_MIN), AREA_GAP_MAX)
+                continue
+            if key == "order":
+                in_order = value == "1"
+                continue
+            numbers = [int(v) for v in value.split(",")]
+            if key == "box" and len(numbers) == 4:  # (an older area: x, y, width, height)
+                key = "rectangle"
+                numbers = [numbers[0], numbers[1], numbers[0] + numbers[2],
+                           numbers[1] + numbers[3]]
+            shape = clean_shape({"type": key, "points": numbers})
+            if shape:
+                shapes.append(shape)
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return (shapes, gap, in_order) if shapes else None
+
+
+# ---------------- Macros ----------------
+# A macro is a list of clicks, clicked one after another in order. A click is
+# {"button": "Left" / "Right" / "Middle", "x": ..., "y": ...}. Saved macros are .txt files
+# in the macros folder (MACROS_DIR):
+#   {macro:"farm"}
+#   {wait:"0.5"}
+#   {left:"812,440"}
+#   {right:"100,200"}
+MACRO_MAX = 150  # most clicks in a macro (each one is a circle on the Macros menu)
+MACRO_WAIT_MIN, MACRO_WAIT_MAX = 0.001, 3600
+MACRO_LETTERS = {"Left": "L", "Right": "R", "Middle": "M"}
+
+
+def clean_macro(clicks):
+    """Well-formed copies of a macro's clicks (anything that isn't one is left out)."""
+    good = []
+    for click in clicks if isinstance(clicks, list) else []:
+        try:
+            if click["button"] in MACRO_LETTERS:
+                good.append({"button": click["button"], "x": int(click["x"]),
+                             "y": int(click["y"])})
+        except (TypeError, KeyError, ValueError):
+            pass
+    return good[:MACRO_MAX]
+
+
+def macro_label(i, click):
+    """A click's letter and number: L1 is a left click and the first click, R2 a right
+    click and the second, M3 a middle click and the third."""
+    return f"{MACRO_LETTERS[click['button']]}{i + 1}"
+
+
+def macros_dir() -> Path:
+    return MACROS_DIR
+
+
+def macro_path(name: str) -> Path:
+    return macros_dir() / f"{name}.txt"
+
+
+def list_macros() -> list:
+    return list_saved(macros_dir())
+
+
+def write_macro(name: str, clicks, wait: float) -> bool:
+    lines = ["{macro:" + json.dumps(name) + "}", "{wait:" + json.dumps(f"{wait:g}") + "}"]
+    for click in clicks:
+        lines.append("{" + click["button"].lower() + ":"
+                     + json.dumps(f"{click['x']},{click['y']}") + "}")
+    return write_saved(macro_path(name), lines)
+
+
+def read_macro(name: str):
+    """(clicks, wait) from a saved macro's file, or None if it can't be read or is empty."""
+    clicks, wait = [], DEFAULTS["macro_wait"]
+    try:
+        lines = macro_path(name).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        match = AREA_LINE.match(line.strip())
+        if not match:
+            continue
+        try:
+            key, value = match.group(1), json.loads(match.group(2))
+            if key == "wait":
+                wait = min(max(float(value), MACRO_WAIT_MIN), MACRO_WAIT_MAX)
+            elif key.capitalize() in MACRO_LETTERS:
+                x, y = (int(v) for v in value.split(","))
+                clicks.append({"button": key.capitalize(), "x": x, "y": y})
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return (clicks[:MACRO_MAX], wait) if clicks else None
+
+
 def read_profile_hotkey(name: str):
     """The hotkey saved in a profile's file (its first few lines), or None."""
     try:
@@ -657,16 +1012,18 @@ def remember_locations() -> None:
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         POINTER_PATH.write_text(json.dumps({"settings": str(SETTINGS_PATH.parent),
-                                            "profiles": str(PROFILES_DIR)}, indent=2),
+                                            "profiles": str(PROFILES_DIR),
+                                            "areas": str(AREAS_DIR),
+                                            "macros": str(MACROS_DIR)}, indent=2),
                                 encoding="utf-8")
     except OSError as err:
         print(f"Could not save folder locations: {err}")
 
 
 def resolve_locations() -> list:
-    """Work out where settings and profiles are kept. If a remembered folder has gone
+    """Work out where settings, profiles and areas are kept. If a remembered folder has gone
     (because it was moved), look for its marker file. Returns what was found elsewhere."""
-    global SETTINGS_PATH, PROFILES_DIR
+    global SETTINGS_PATH, PROFILES_DIR, AREAS_DIR, MACROS_DIR
     try:
         saved = json.loads(POINTER_PATH.read_text(encoding="utf-8"))
         saved = saved if isinstance(saved, dict) else {}
@@ -675,7 +1032,12 @@ def resolve_locations() -> list:
     found = []
     folders = {}
     for kind, marker, default in (("settings", SETTINGS_MARKER, DEFAULT_SETTINGS_DIR),
-                                  ("profiles", PROFILES_MARKER, DEFAULT_PROFILES_DIR)):
+                                  ("profiles", PROFILES_MARKER, DEFAULT_PROFILES_DIR),
+                                  ("areas", AREAS_MARKER, DEFAULT_AREAS_DIR),
+                                  ("macros", MACROS_MARKER, DEFAULT_MACROS_DIR)):
+        if kind == "macros" and "macros" not in saved and "areas" in folders \
+                and folders["areas"] != DEFAULT_AREAS_DIR:
+            default = folders["areas"].parent / "macros"  # (first time: next to the areas)
         folder = Path(saved[kind]) if isinstance(saved.get(kind), str) else default
         if kind in saved and not (folder / marker).exists():
             moved_to = find_marker(marker)
@@ -685,10 +1047,31 @@ def resolve_locations() -> list:
         folders[kind] = folder
     SETTINGS_PATH = folders["settings"] / "settings.json"
     PROFILES_DIR = folders["profiles"]
+    AREAS_DIR = folders["areas"]
+    MACROS_DIR = folders["macros"]
     mark_folder(SETTINGS_PATH.parent, SETTINGS_MARKER, "settings")
     mark_folder(PROFILES_DIR, PROFILES_MARKER, "profiles")
+    mark_folder(AREAS_DIR, AREAS_MARKER, "saved areas")
+    mark_folder(MACROS_DIR, MACROS_MARKER, "saved macros")
+    move_old_areas()
     remember_locations()
     return found
+
+
+def move_old_areas() -> None:
+    """Areas used to be kept in an "areas" folder inside the profiles folder: move any
+    found there into the areas folder (never replacing one that's already there)."""
+    old = PROFILES_DIR / "areas"
+    try:
+        if not old.is_dir() or old.resolve() == AREAS_DIR.resolve():
+            return
+        AREAS_DIR.mkdir(parents=True, exist_ok=True)
+        for file in old.glob("*.txt"):
+            if not (AREAS_DIR / file.name).exists():
+                shutil.move(str(file), str(AREAS_DIR / file.name))
+        old.rmdir()  # only if nothing else is left in it
+    except OSError:
+        pass
 
 
 def choose_folder(root, start: Path):
@@ -777,24 +1160,23 @@ def system_is_dark() -> bool:
 
 
 def icon_png(size: int, style: str) -> bytes:
-    """The app icon as a PNG: the sidebar logo in black and white (see ICON_STYLES),
-    with a see-through background."""
+    """The app icon as a PNG: the penguin logo (see ICON_STYLES), with a see-through
+    background."""
     margin = round(size * 0.06)  # a little space around it, like other app icons
     inner = size - 2 * margin
-    masks = logo_masks(inner, samples=4 if inner <= 64 else 2)
-    square_rgb, cursor_rgb = ([int(c[i:i + 2], 16) for i in (1, 3, 5)]
-                              for c in ICON_STYLES[style])
+    image = pointer_image()
+    masks = logo_masks(inner, samples=4 if inner <= 64 else 2, arrow=image is None)
+    pointer = pointer_layer(inner, image) if image else {}
+    colors = logo_colors(ICON_STYLES[style])
     blank = b"\0\0\0\0" * size
     rows = [blank] * margin
-    for row in masks:
+    for y, row in enumerate(masks):
         pixels = bytearray(b"\0\0\0\0" * margin)
-        for square, mark in row:
-            if square <= 0:
-                pixels += b"\0\0\0\0"
-                continue
-            cursor = mark / square  # how much of the visible part is the cursor
-            pixels += bytes(round(a + (b - a) * cursor) for a, b in zip(square_rgb, cursor_rgb))
-            pixels.append(round(255 * square))
+        for x, parts in enumerate(row):
+            rgb, covered = logo_pixel(parts, colors, down=(y + 0.5) / inner)
+            if (x, y) in pointer:
+                rgb, covered = over(pointer[x, y], rgb, covered)
+            pixels += bytes(rgb) + bytes((round(255 * covered),))
         pixels += b"\0\0\0\0" * margin
         rows.append(bytes(pixels))
     rows += [blank] * margin
@@ -1621,75 +2003,288 @@ def render_switch(image, w, h, pad, pos, track_color, bg_color):
     image.put(" ".join("{" + " ".join(pixels[y * w:(y + 1) * w]) + "}" for y in range(h)))
 
 
-def logo_masks(size, samples=4):
-    """Work out the logo's shapes once: for each pixel, how much is covered by the
-    rounded square, and how much by the white cursor + click lines (0..1 each).
-    Drawn on a 28x28 grid and scaled to `size`, with 4x4 samples per pixel for smooth edges."""
-    s = size / 28
-    radius = 7 * s
-    # cursor arrow, tip at (11, 9)
-    arrow = [(x * s, y * s) for x, y in
-             ((11, 9), (11, 22.5), (14.2, 19.4), (16.6, 24.4), (19, 23.3),
-              (16.7, 18.4), (21.2, 18.4))]
-    # three short "click" lines around the tip
-    rays = [((11 * s, 5.6 * s), (11 * s, 3.4 * s)),
-            ((7.6 * s, 9 * s), (5.4 * s, 9 * s)),
-            ((8.5 * s, 6.5 * s), (6.9 * s, 4.9 * s))]
-    ray_half_width = 0.85 * s
+def logo_masks(size, samples=4, arrow=True):
+    """Work out the logo's shapes once: a round penguin seen from the side, with a round
+    white face, one eye, a white belly, a flipper, a little tail, orange beak and feet, and
+    a mouse cursor on its belly (arrow=False leaves the cursor out: the computer's own
+    mouse pointer goes there instead, see pointer_layer). Drawn
+    on a 100x100 grid and scaled to `size`, with samples x samples points per pixel for
+    smooth edges. For each pixel: {part: how much of it (0..1)}, where the parts are the
+    names in `parts` below (later ones cover earlier ones)."""
+    s = size / 100
+    SHIFT = 3  # (moves the whole drawing right a little, to centre it)
 
-    def in_square(x, y):
-        cx = min(max(x, radius), size - radius)
-        cy = min(max(y, radius), size - radius)
-        return (x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2
+    def ellipse(cx, cy, rx, ry, turn=0.0):
+        cx, cy, rx, ry = (cx + SHIFT) * s, cy * s, rx * s, ry * s
+        c, n = math.cos(math.radians(turn)), math.sin(math.radians(turn))
 
-    def in_arrow(x, y):  # standard even-odd point-in-polygon test
-        inside = False
-        for (x1, y1), (x2, y2) in zip(arrow, arrow[1:] + arrow[:1]):
-            if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
-                inside = not inside
+        def inside(x, y):
+            dx, dy = x - cx, y - cy
+            return ((dx * c + dy * n) / rx) ** 2 + ((-dx * n + dy * c) / ry) ** 2 <= 1
+        reach = max(rx, ry)
+        inside.box = (cx - reach, cy - reach, cx + reach, cy + reach)
         return inside
 
-    def on_ray(x, y):
-        for (x1, y1), (x2, y2) in rays:
-            dx, dy = x2 - x1, y2 - y1
-            t = min(max(((x - x1) * dx + (y - y1) * dy) / (dx * dx + dy * dy), 0), 1)
-            if math.hypot(x - x1 - t * dx, y - y1 - t * dy) <= ray_half_width:
-                return True
-        return False
+    def polygon(points, grow=0.0):
+        """Inside the polygon, or within `grow` of its edges (which rounds its corners)."""
+        pts = [((x + SHIFT) * s, y * s) for x, y in points]
+        reach = grow * s
 
+        def edge_distance(x, y):
+            best = math.inf
+            for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1]):
+                dx, dy = x2 - x1, y2 - y1
+                t = min(max(((x - x1) * dx + (y - y1) * dy) / (dx * dx + dy * dy), 0), 1)
+                best = min(best, math.hypot(x - x1 - t * dx, y - y1 - t * dy))
+            return best
+
+        def inside(x, y):  # even-odd test
+            hit = False
+            for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1]):
+                if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+                    hit = not hit
+            if hit or not reach:
+                return hit
+            return edge_distance(x, y) <= reach
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        inside.box = (min(xs) - reach, min(ys) - reach, max(xs) + reach, max(ys) + reach)
+        return inside
+
+    def union(*parts):
+        def inside(x, y):
+            return any(p(x, y) for p in parts)
+        inside.box = (min(p.box[0] for p in parts), min(p.box[1] for p in parts),
+                      max(p.box[2] for p in parts), max(p.box[3] for p in parts))
+        return inside
+
+    def clip(part, within):
+        def inside(x, y):
+            return within(x, y) and part(x, y)
+        inside.box = part.box
+        return inside
+
+    # the body: a round head on top of a wider, egg-shaped body, joined smoothly
+    def body_shape(less=0.0):
+        return union(ellipse(48, 27, 17 - less, 17 - less),
+                     ellipse(44, 64, 25 - less, 31 - less),
+                     polygon([(31 + less, 27), (65 - less, 27), (69 - less, 62),
+                              (19 + less, 62)]))
+    body, inner = body_shape(), body_shape(4)
+    corners = [(0, 0), (0, 15), (3.6, 11.6), (6.2, 17.1), (8.8, 15.9), (6.3, 10.5), (11.3, 10.5)]
+    corners = [(55 + x * 2.4, 53 + y * 2.4) for x, y in corners]  # (tip at POINTER_TIP)
+    parts = [  # painted in this order
+        ("feet", union(ellipse(36, 94, 9, 4), ellipse(52, 94.5, 11, 4.5))),
+        ("beak", polygon([(59, 22), (80, 29), (59, 35)], grow=1.2)),
+        ("body", union(body, polygon([(24, 82), (16, 92.5), (31, 91)], grow=1.5))),  # + tail
+        # a round white face and a white belly down its front, kept just inside the body's
+        # edge (so the body still shows round them on a white background)
+        ("face", union(clip(ellipse(53, 27, 11.5, 11.5), inner),
+                       clip(ellipse(55, 68, 16, 25), inner))),
+        ("flipper", ellipse(29, 61, 6.5, 18.5, turn=-14)),
+        ("eye", ellipse(54, 24, 4.6, 4.6)),
+        ("shine", ellipse(55.6, 22.4, 1.6, 1.6)),
+    ] + ([("cursor_edge", polygon(corners, grow=2.4)), ("cursor", polygon(corners))] if arrow
+          else [])
+    names = [name for name, _ in parts]
     masks = []
     step = 1 / samples
+    n = samples * samples
     for py in range(size):
+        row_parts = [(i, test) for i, (_name, test) in enumerate(parts)
+                     if test.box[1] - 1 <= py + 1 and test.box[3] + 1 >= py]
         row = []
         for px in range(size):
-            square = white = 0
+            here = [(i, test) for i, test in row_parts
+                    if test.box[0] - 1 <= px + 1 and test.box[2] + 1 >= px]
+            counts = {}
             for sy in range(samples):
                 for sx in range(samples):
                     x, y = px + (sx + 0.5) * step, py + (sy + 0.5) * step
-                    if in_square(x, y):
-                        square += 1
-                        if in_arrow(x, y) or on_ray(x, y):
-                            white += 1
-            n = samples * samples
-            row.append((square / n, white / n))
+                    for i, test in reversed(here):  # the top one that covers it
+                        if test(x, y):
+                            counts[names[i]] = counts.get(names[i], 0) + 1
+                            break
+            row.append({name: c / n for name, c in counts.items()})
         masks.append(row)
     return masks
 
 
-class Logo(tk.Canvas):
-    """The app's logo for the top of the sidebar: a rounded square in the soft accent colour
-    of the highlighted sidebar tab, with a cursor, and the name stacked next to it."""
+def logo_gradient(color):
+    """The penguin's body colours, top to bottom: a lighter colour a little round the
+    colour wheel at the top, fading into `color` (a little deeper) at the bottom."""
+    h, sat, v = hex_to_hsv(color)
+    return (hsv_to_hex((h + 0.11) % 1, max(0.35, sat * 0.75), min(1, v * 1.08 + 0.08)),
+            hsv_to_hex(h, min(1, sat * 1.05), v * 0.92))
 
-    ICON = 30  # icon size in pixels
+
+def logo_colors(color):
+    """The colour of each part of the logo (see logo_masks) for a penguin of `color`. The
+    body and flipper are gradients: (top, bottom)."""
+    top, bottom = logo_gradient(color)
+    return {"body": (top, bottom), "beak": "#ff9f2e", "feet": "#ff9f2e", "face": "#ffffff",
+            "flipper": (mix_color(top, "#000000", 0.2), mix_color(bottom, "#000000", 0.2)),
+            "eye": "#17131f", "shine": "#ffffff", "cursor_edge": "#1a1a1a",
+            "cursor": "#ffffff"}
+
+
+def logo_pixel(parts, colors, bg=None, down=0.5):
+    """One pixel of the logo: its parts mixed by how much of the pixel each covers (see
+    logo_masks), over `bg`. down: how far down the logo the pixel is (0..1, for the
+    body's gradient). Returns ((r, g, b), how much of the pixel the logo covers)."""
+    covered = sum(parts.values())
+    rgb = [0.0, 0.0, 0.0]
+    for name, amount in parts.items():
+        color = colors[name]
+        if isinstance(color, tuple):  # a gradient from top to bottom
+            color = mix_color(color[0], color[1], down)
+        for c in range(3):
+            rgb[c] += int(color[1 + 2 * c:3 + 2 * c], 16) * amount
+    if bg is not None:  # (on a background: it fills in the rest)
+        for c in range(3):
+            rgb[c] += bg[c] * (1 - covered)
+    elif covered:
+        rgb = [v / covered for v in rgb]
+    return tuple(round(v) for v in rgb), covered
+
+
+# The computer's own mouse pointer goes on the logo's belly: its tip here (on the logo's
+# 100x100 grid), and this tall
+POINTER_TIP = (58, 53)
+POINTER_HEIGHT = 42
+_pointer_found = []  # [the pointer image, or None], once looked up
+
+
+def pointer_image():
+    """The mouse pointer of this computer's cursor theme (the one you see on screen), the
+    biggest size the theme has: (width, height, hot x, hot y, pixels), the pixels being
+    ARGB numbers (premultiplied, like the file has them). None if there isn't one: the
+    logo then draws its own cursor."""
+    if not _pointer_found:
+        try:
+            _pointer_found.append(find_pointer())
+        except (OSError, ValueError, struct.error):
+            _pointer_found.append(None)
+    return _pointer_found[0]
+
+
+def find_pointer():
+    names = []
+    try:
+        theme = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface",
+                                "cursor-theme"], capture_output=True, text=True,
+                               timeout=2).stdout.strip().strip("'\"")
+        names.append(theme)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    names += [os.environ.get("XCURSOR_THEME", ""), "default"]
+    folders = [Path.home() / ".icons", Path.home() / ".local" / "share" / "icons",
+               Path("/usr/share/icons"), Path("/usr/share/pixmaps")]
+    seen = set()
+    while names and len(seen) < 12:
+        name = names.pop(0)
+        if not name or name in seen or "/" in name:
+            continue
+        seen.add(name)
+        for folder in folders:
+            theme = folder / name
+            for cursor in ("left_ptr", "default", "arrow"):
+                image = read_xcursor(theme / "cursors" / cursor)
+                if image:
+                    return image
+            try:  # a theme can borrow its cursors from another one
+                index = (theme / "index.theme").read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for line in index.splitlines():
+                if line.strip().lower().startswith("inherits") and "=" in line:
+                    names += [n.strip() for n in re.split("[,;]", line.split("=", 1)[1])]
+    return None
+
+
+def read_xcursor(path: Path):
+    """The biggest picture in an X cursor file, or None (see pointer_image)."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if data[:4] != b"Xcur":
+        return None
+    best = None
+    for i in range(min(struct.unpack_from("<I", data, 12)[0], 500)):
+        kind, size, start = struct.unpack_from("<III", data, 16 + 12 * i)
+        if kind == 0xFFFD0002 and (best is None or size > best[0]):  # a picture
+            best = (size, start)
+    if best is None:
+        return None
+    w, h, xhot, yhot = struct.unpack_from("<IIII", data, best[1] + 16)
+    if not (0 < w <= 512 and 0 < h <= 512):
+        return None
+    return w, h, xhot, yhot, struct.unpack_from(f"<{w * h}I", data, best[1] + 36)
+
+
+def pointer_layer(size, image):
+    """The pointer scaled onto a logo `size` pixels across, its tip at POINTER_TIP:
+    {(x, y): ((r, g, b), how much of the pixel it covers)} for the pixels it's on."""
+    w, h, xhot, yhot, pixels = image
+    rows = [y for y in range(h) if any(pixels[y * w + x] >> 24 for x in range(w))]
+    if not rows:
+        return {}
+    k = POINTER_HEIGHT * size / 100 / (rows[-1] - rows[0] + 1)  # logo pixels per pointer pixel
+    tx, ty = POINTER_TIP[0] * size / 100, POINTER_TIP[1] * size / 100
+    n = max(2, min(8, math.ceil(1 / k) + 1))  # samples each way in each logo pixel
+    layer = {}
+    for py in range(max(0, int(ty - yhot * k)), min(size, math.ceil(ty + (h - yhot) * k) + 1)):
+        for px in range(max(0, int(tx - xhot * k)), min(size, math.ceil(tx + (w - xhot) * k) + 1)):
+            total = [0.0, 0.0, 0.0, 0.0]
+            for sy in range(n):
+                fy = yhot + (py + (sy + 0.5) / n - ty) / k - 0.5
+                y0 = math.floor(fy)
+                for sx in range(n):
+                    fx = xhot + (px + (sx + 0.5) / n - tx) / k - 0.5
+                    x0 = math.floor(fx)
+                    # blend the 4 nearest pointer pixels (smooth when it's made bigger)
+                    for cy, wy in ((y0, 1 - (fy - y0)), (y0 + 1, fy - y0)):
+                        for cx, wx in ((x0, 1 - (fx - x0)), (x0 + 1, fx - x0)):
+                            if 0 <= cx < w and 0 <= cy < h and wx * wy:
+                                v, part = pixels[cy * w + cx], wx * wy
+                                total[0] += ((v >> 16) & 255) * part
+                                total[1] += ((v >> 8) & 255) * part
+                                total[2] += (v & 255) * part
+                                total[3] += (v >> 24) * part
+            if total[3] > 0.01:
+                rgb = tuple(min(255.0, c * 255 / total[3]) for c in total[:3])
+                layer[px, py] = (rgb, total[3] / (n * n * 255))
+    return layer
+
+
+def over(top, rgb, covered):
+    """A pixel of the pointer (see pointer_layer) on top of a logo pixel (see logo_pixel)."""
+    (trgb, ta) = top
+    out = ta + covered * (1 - ta)
+    if out <= 0:
+        return rgb, 0.0
+    mixed = tuple(round((t * ta + b * covered * (1 - ta)) / out) for t, b in zip(trgb, rgb))
+    return mixed, out
+
+
+class Logo(tk.Canvas):
+    """The app's logo for the top of the sidebar: the penguin with its cursor, in the
+    accent colour, and the name stacked next to it."""
+
+    ICON = 42  # icon size in pixels
     GAP = 8    # space between icon and name
 
-    def __init__(self, parent, font, width=92):
+    def __init__(self, parent, font):
         f = tkfont.Font(font=font)
         height = max(self.ICON, f.metrics("linespace") * 2)
+        width = self.ICON + self.GAP + max(f.measure("Auto"), f.measure("Clicker")) + 4
         super().__init__(parent, width=width, height=height, highlightthickness=0, bd=0)
         self.font = font
         self.palette = None
-        self.masks = logo_masks(self.ICON)  # shapes don't change, only colours do
+        # the shapes don't change, only the colours do
+        image = pointer_image()
+        self.masks = logo_masks(self.ICON, arrow=image is None)
+        self.pointer = pointer_layer(self.ICON, image) if image else {}
         self.image = tk.PhotoImage(width=self.ICON, height=self.ICON)
         self.bind("<Configure>", lambda e: self.redraw())
 
@@ -1711,17 +2306,16 @@ class Logo(tk.Canvas):
             return
         p = self.palette
         bg = [int(p["bg"][i:i + 2], 16) for i in (1, 3, 5)]
-        # same softer accent and text colour as the highlighted sidebar tab
-        accent = [int(p["select"][i:i + 2], 16) for i in (1, 3, 5)]
-        cursor = [int(p["select_fg"][i:i + 2], 16) for i in (1, 3, 5)]
+        colors = logo_colors(p["accent"])
         rows = []
-        for row in self.masks:
+        for y, row in enumerate(self.masks):
+            down = (y + 0.5) / self.ICON
             pixels = []
-            for square, mark in row:
-                # background where the square isn't, accent inside it, cursor colour on top
-                color = [b * (1 - square) + a * (square - mark) + c * mark
-                         for b, a, c in zip(bg, accent, cursor)]
-                pixels.append("#%02x%02x%02x" % tuple(round(c) for c in color))
+            for x, parts in enumerate(row):
+                rgb = logo_pixel(parts, colors, bg, down)[0]
+                if (x, y) in self.pointer:
+                    rgb = over(self.pointer[x, y], rgb, 1.0)[0]
+                pixels.append("#%02x%02x%02x" % rgb)
             rows.append("{" + " ".join(pixels) + "}")
         self.image.put(" ".join(rows))
 
@@ -2470,6 +3064,36 @@ class StatusDot(tk.Canvas):
             paint_dot(self.image, self.SIZE, p["accent"] if self.on else p["border"], p["bg"])
 
 
+class ClickBadge(tk.Canvas):
+    """A small circle in the accent colour with a macro click's label in it (L1, R2...),
+    for the list on the Macros page. It's themed like the other widgets, so it changes
+    with the accent colour."""
+
+    SIZE = 30
+    _images = {}  # (accent, background) -> the circle's picture, shared by every badge
+
+    def __init__(self, parent, text, font, small_font):
+        super().__init__(parent, width=self.SIZE, height=self.SIZE, highlightthickness=0,
+                         bd=0)
+        self.image = None
+        self.picture = self.create_image(0, 0, anchor="nw")
+        self.label = self.create_text(self.SIZE / 2, self.SIZE / 2, text=text,
+                                      font=font if len(text) <= 3 else small_font)
+
+    def set_palette(self, palette):
+        key = (palette["accent"], palette["bg"])
+        image = self._images.get(key)
+        if image is None:
+            if len(self._images) > 40:  # (fading between colours makes lots of them)
+                self._images.clear()
+            image = self._images[key] = tk.PhotoImage(width=self.SIZE, height=self.SIZE)
+            paint_dot(image, self.SIZE, palette["accent"], palette["bg"])
+        self.image = image  # (kept here too, so it lasts while this badge shows it)
+        self.configure(bg=palette["bg"])
+        self.itemconfigure(self.picture, image=image)
+        self.itemconfigure(self.label, fill=palette["accent_fg"])
+
+
 _areas = {"when": 0.0, "areas": None, "busy": False}  # see screen_areas
 
 
@@ -2818,6 +3442,888 @@ class ScreenPicker(tk.Toplevel):
         self.on_pick(x, y)
 
 
+def draw_shape(canvas, shape, color, width=2, dash=None, tags=""):
+    p = shape["points"]
+    if shape["type"] == "rectangle":
+        return canvas.create_rectangle(*p, outline=color, width=width, dash=dash, tags=tags)
+    if shape["type"] == "circle":
+        return canvas.create_oval(*p, outline=color, width=width, dash=dash, tags=tags)
+    return canvas.create_polygon(*p, outline=color, fill="", width=width, dash=dash, tags=tags)
+
+
+def outline_rects(shape, pad=3, step=3):
+    """Little squares covering a shape's outline (pad pixels either side of it), for
+    cutting a window down to just the outline (see WindowShape)."""
+    p = shape["points"]
+    size = 2 * pad + 1
+    if shape["type"] == "rectangle":
+        x1, y1, x2, y2 = p
+        w, h = x2 - x1 + size, y2 - y1 + size
+        return [(x1 - pad, y1 - pad, w, size), (x1 - pad, y2 - pad, w, size),
+                (x1 - pad, y1 - pad, size, h), (x2 - pad, y1 - pad, size, h)]
+    if shape["type"] == "circle":
+        cx, cy = (p[0] + p[2]) / 2, (p[1] + p[3]) / 2
+        rx, ry = (p[2] - p[0]) / 2, (p[3] - p[1]) / 2
+        n = max(24, int(2 * math.pi * max(rx, ry) / step))
+        points = [(cx + rx * math.cos(2 * math.pi * i / n), cy + ry * math.sin(2 * math.pi * i / n))
+                  for i in range(n)]
+        return [(int(x) - pad, int(y) - pad, size, size) for x, y in points]
+    return line_rects(shape_corners(shape), closed=True, pad=pad, step=step)
+
+
+def line_rects(points, closed=False, pad=3, step=3):
+    """Little squares covering the lines between some points."""
+    size, rects = 2 * pad + 1, []
+    pairs = list(zip(points, points[1:] + (points[:1] if closed else [])))
+    for (xa, ya), (xb, yb) in pairs:
+        n = max(1, int(math.hypot(xb - xa, yb - ya) / step))
+        for i in range(n + 1):
+            x, y = xa + (xb - xa) * i / n, ya + (yb - ya) * i / n
+            rects.append((int(x) - pad, int(y) - pad, size, size))
+    return rects
+
+
+def rounded_rects(x, y, w, h, r):
+    """Rows of rectangles that together make a rounded rectangle."""
+    rects = []
+    for row in range(h):
+        d = r - row - 0.5 if row < r else (row - (h - r) + 0.5 if row >= h - r else 0)
+        inset = int(round(r - math.sqrt(max(r * r - d * d, 0)))) if d else 0
+        if rects and rects[-1][4] == inset:
+            rects[-1][3] += 1
+        else:
+            rects.append([x + inset, y + row, w - 2 * inset, 1, inset])
+    return [tuple(r_[:4]) for r_ in rects]
+
+
+class WindowShape:
+    """Cuts a window down to some rectangles: it only shows there, and the screen behind
+    shows everywhere else. The mouse goes straight through it to whatever is underneath.
+    X11 shape extension. `ok` is False if this computer can't do it."""
+
+    def __init__(self, window):
+        self.ok = False
+        try:
+            import ctypes
+            import ctypes.util
+            self.ctypes = ctypes
+            x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+            xext = ctypes.CDLL(ctypes.util.find_library("Xext"))
+        except (OSError, TypeError):
+            return
+
+        class Rect(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short),
+                        ("width", ctypes.c_ushort), ("height", ctypes.c_ushort)]
+        self.Rect = Rect
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XFlush.argtypes = [ctypes.c_void_p]
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        x11.XQueryTree.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
+            ctypes.POINTER(ctypes.c_uint)]
+        x11.XFree.argtypes = [ctypes.c_void_p]
+        xext.XShapeCombineRectangles.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(Rect), ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        self.x11, self.xext = x11, xext
+        self.display = x11.XOpenDisplay(None)
+        if not self.display:
+            return
+        # Tk wraps each top-level window in an outer X window: cut that one too
+        inner = window.winfo_id()
+        root_id, parent = ctypes.c_ulong(), ctypes.c_ulong()
+        children, count = ctypes.POINTER(ctypes.c_ulong)(), ctypes.c_uint()
+        x11.XQueryTree(self.display, inner, ctypes.byref(root_id), ctypes.byref(parent),
+                       ctypes.byref(children), ctypes.byref(count))
+        if children:
+            x11.XFree(children)
+        self.targets = [inner]
+        if parent.value and parent.value != root_id.value:
+            self.targets.append(parent.value)
+        self.ok = True
+
+    def set(self, rects, width, height):
+        if not self.ok:
+            return
+        R = self.Rect
+        shown = (R * max(1, len(rects)))(*[R(int(x), int(y), max(0, int(w)), max(0, int(h)))
+                                          for x, y, w, h in rects])
+        nothing = (R * 1)(R(0, 0, 0, 0))
+        for xid in self.targets:
+            # 0 = what's shown (ShapeBounding), 2 = what catches the mouse (ShapeInput:
+            # none of it); 0, 0: no offset, 0: replace (ShapeSet), 0: in no particular order
+            self.xext.XShapeCombineRectangles(self.display, xid, 0, 0, 0, shown, len(rects), 0, 0)
+            self.xext.XShapeCombineRectangles(self.display, xid, 2, 0, 0, nothing, 0, 0, 0)
+        self.x11.XFlush(self.display)
+
+    def close(self):
+        if self.ok and self.display:
+            self.x11.XCloseDisplay(self.display)
+            self.display = None
+
+
+class ScreenLayer(tk.Toplevel):
+    """A see-through layer over the whole screen, with a menu at the top (the Areas and
+    Macros menus). Only the menu, what's drawn and a thin frame round the screen show, so
+    you can see what's behind.
+    It's two windows: this one is invisible and catches the mouse everywhere, and `view`
+    on top shows the drawing but lets the mouse through (a window cut down to what's drawn
+    can only catch the mouse on that, see WindowShape).
+    Anything drawn in the accent colour is tagged (see ACCENT_TAGS), so set_accent can
+    recolour it when the accent colour changes."""
+
+    EDGE = "#000000"    # dark edge round outlines, so they show on light screens too
+    PANEL = "#1f1f1f"   # behind the menu and labels
+    BAR_H, BAR_GAP = 34, 6
+    ACCENT_TAGS = {  # tag: (option, colour worked out from the accent)
+        "accent_fill": ("fill", lambda a: a),
+        "accent_outline": ("outline", lambda a: a),
+        "accent_edge": ("outline", lambda a: mix_color(a, "#000000", 0.5)),  # a darker shade
+        "accent_ink": ("fill", text_on),  # text on the accent colour
+    }
+
+    def __init__(self, root, accent):
+        super().__init__(root)
+        self.accent = accent
+        self.buttons = {}   # menu button name -> (x1, y1, x2, y2)
+        self.bar_down = None
+        self.regions = {}   # name -> rectangles of this layer that show (see show_regions)
+        self.cutter = None
+        self.width, self.height = self.winfo_screenwidth(), self.winfo_screenheight()
+        # this window: over the whole screen, catching the mouse, all but invisible
+        self.overrideredirect(True)
+        self.no_shadow(self)
+        self.geometry(f"{self.width}x{self.height}+0+0")
+        self.configure(bg="#000000", cursor="crosshair")
+        try:
+            self.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        # (Tk can only make a window see-through once it's on screen: do it the moment
+        # it appears)
+        self.bind("<Map>", lambda e: e.widget is self and self.attributes("-alpha", 0.01),
+                  add="+")
+        self.catcher = tk.Frame(self, bg="#000000", cursor="crosshair")
+        self.catcher.pack(fill="both", expand=True)
+        # the drawing on top, see-through except for what's drawn on it
+        self.view = view = tk.Toplevel(self)
+        view.overrideredirect(True)
+        self.no_shadow(view)
+        view.geometry(f"{self.width}x{self.height}+0+0")
+        try:
+            view.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        # until it's been cut down to what's drawn, keep it invisible (no black flash)
+        view.bind("<Map>", lambda e: e.widget is view and self.set_alpha(0.0), add="+")
+        c = self.canvas = tk.Canvas(view, width=self.width, height=self.height, bg=self.PANEL,
+                                    highlightthickness=0, bd=0, cursor="crosshair")
+        c.pack(fill="both", expand=True)
+        # the menu and messages go on the monitor the mouse is on
+        mx, my = self.winfo_pointerxy()
+        self.monitor = (0, 0, self.width, self.height)
+        for x, y, w, h in screen_areas() or [self.monitor]:
+            if x <= mx < x + w and y <= my < y + h:
+                self.monitor = (x, y, w, h)
+                break
+        x, y, w, h = self.monitor
+        self.top_middle = (x + w // 2, y + 24)
+        self.draw_frame()
+
+    def bind_mouse(self, **handlers):
+        """Bind mouse events on both layers. (The mouse normally reaches the catcher, but
+        if the drawing can't be made see-through it covers the screen and gets it itself.)"""
+        for widget in (self.catcher, self.canvas):
+            for sequence, handler in handlers.items():
+                widget.bind(f"<{sequence.replace('_', '-')}>", handler)
+
+    def show_now(self):
+        """Put it on screen, cut down to what's drawn, and catch the mouse and keys."""
+        # wait (up to 2 seconds) until both layers are on screen
+        began = time.monotonic()
+        while time.monotonic() - began < 2:
+            self.update()
+            if self.winfo_viewable() and self.view.winfo_viewable():
+                break
+            time.sleep(0.01)
+        self.update_idletasks()
+        self.cutter = WindowShape(self.view)
+        if self.cutter.ok:
+            self.show_regions()
+            self.set_alpha(1.0)
+        else:  # can't cut it down: dim the screen instead, so it can still be used
+            self.set_alpha(0.45)
+        self.view.lift()
+        try:
+            self.grab_set_global()
+        except tk.TclError:
+            pass
+        self.focus_force()
+
+    @staticmethod
+    def no_shadow(window):
+        """Mark it as a drag-and-drop window: the desktop draws no shadow round those. (It
+        would otherwise draw one round every outline and dot: smudgy, and very slow.)"""
+        try:
+            window.attributes("-type", "dnd")
+        except tk.TclError:
+            pass
+
+    def set_alpha(self, value):
+        """How see-through the drawing layer is."""
+        try:
+            self.view.attributes("-alpha", value)
+        except tk.TclError:
+            pass
+
+    def set_accent(self, accent):
+        """Recolour everything drawn in the accent colour (the app's accent changed)."""
+        if accent == self.accent:
+            return
+        self.accent = accent
+        try:
+            for tag, (option, color) in self.ACCENT_TAGS.items():
+                self.canvas.itemconfigure(tag, **{option: color(accent)})
+        except tk.TclError:
+            pass  # (closing)
+
+    def show_regions(self):
+        """Show just the parts that have something on them (see WindowShape)."""
+        if self.cutter is not None and self.cutter.ok:
+            self.cutter.set([r for rects in self.regions.values() for r in rects],
+                            self.width, self.height)
+
+    def close(self):
+        if self.cutter is not None:
+            self.cutter.close()
+        self.destroy()
+
+    def draw_frame(self):
+        """A thin accent-coloured frame round the monitor: the menu is open."""
+        x, y, w, h = self.monitor
+        t = 3
+        self.canvas.create_rectangle(x, y, x + w, y + h, outline=self.accent, width=2 * t,
+                                     tags=("frame", "accent_outline"))
+        self.regions["frame"] = [(x, y, w, t), (x, y + h - t, w, t), (x, y, t, h),
+                                 (x + w - t, y, t, h)]
+
+    def draw_panel(self, x1, y1, x2, y2, tags, region):
+        """A dark rounded panel (behind the menu, messages and labels)."""
+        self.canvas.create_polygon(rounded_points(x1, y1, x2, y2, 10), smooth=True,
+                                   fill=self.PANEL, outline="#444444", tags=tags)
+        self.regions[region] = rounded_rects(int(x1), int(y1), int(x2 - x1) + 1,
+                                             int(y2 - y1) + 1, 10)
+
+    def draw_message(self, text):
+        c = self.canvas
+        item = c.create_text(self.top_middle[0], self.top_middle[1] + 16, text=text,
+                             fill="#ffffff", font=("TkDefaultFont", 14, "bold"), tags="bar")
+        x1, y1, x2, y2 = c.bbox(item)
+        self.draw_panel(x1 - 16, y1 - 10, x2 + 16, y2 + 10, "bar", "bar")
+        c.tag_raise(item)
+
+    def draw_menu(self, names, labels, hint, chosen=None, gap_before=None, lit=None):
+        """The menu at the top: a row of buttons (Done and `lit`, a switch that's on, in the
+        accent colour, `chosen` in white) with a hint under them. gap_before: a little space
+        before this button."""
+        c = self.canvas
+        c.delete("bar")
+        font = ("TkDefaultFont", 12, "bold")
+        widths = [tkfont.Font(font=font).measure(labels[n]) + 28 for n in names]
+        extra = 18 if gap_before in names else 0
+        total = sum(widths) + self.BAR_GAP * (len(names) - 1) + extra
+        x, y = self.top_middle[0] - total // 2, self.top_middle[1]
+        hint_item = c.create_text(self.top_middle[0], y + self.BAR_H + 20, text=hint,
+                                  fill="#dddddd", font=("TkDefaultFont", 12), tags="bar")
+        hx1, _hy1, hx2, hy2 = c.bbox(hint_item)
+        left = min(x, hx1) - 12
+        right = max(x + total, hx2) + 12
+        self.draw_panel(left, y - 10, right, hy2 + 10, "bar", "bar")
+        c.tag_raise(hint_item)
+        self.buttons = {}
+        for name, w in zip(names, widths):
+            if name == gap_before:
+                x += extra
+            points = rounded_points(x, y, x + w, y + self.BAR_H, 9)
+            if name in ("done", lit):
+                c.create_polygon(points, smooth=True, fill=self.accent, outline="",
+                                 tags=("bar", "accent_fill"))
+                ink, tags = text_on(self.accent), ("bar", "accent_ink")
+            else:
+                c.create_polygon(points, smooth=True, outline="", tags="bar",
+                                 fill="#ffffff" if name == chosen else "#3a3a3a")
+                ink, tags = ("#000000" if name == chosen else "#ffffff"), "bar"
+            c.create_text(x + w / 2, y + self.BAR_H / 2, text=labels[name], font=font,
+                          fill=ink, tags=tags)
+            self.buttons[name] = (x, y, x + w, y + self.BAR_H)
+            x += w + self.BAR_GAP
+        self.show_regions()
+
+    def on_bar(self, event):
+        """The menu button under the mouse, if any."""
+        for name, (x1, y1, x2, y2) in self.buttons.items():
+            if x1 <= event.x_root <= x2 and y1 <= event.y_root <= y2:
+                return name
+        return None
+
+
+class ShapeDrawer(ScreenLayer):
+    """The Areas menu: a see-through layer over the whole screen for drawing an area's
+    shapes (see ScreenLayer). The menu picks the shape (Rectangle, Circle, Triangle,
+    Polygon), Clear takes every shape away, Undo takes back the last thing done, and Done
+    (or Esc) finishes; it stays open in between, so you can draw as many as you like.
+    Rectangles, circles and triangles: drag. Hold Shift for a square / round circle, and
+    drag upwards for a triangle that points down. Polygons: click each corner, then
+    double-click or press Enter (Backspace takes the last corner off).
+    kind=None just shows the shapes and the spots that will be clicked (click to close).
+    In order (on the menu) switches between clicking one shape after another and all of
+    them together; while it's on, each shape shows its number.
+    on_done(shapes, cleared, in_order) gets the new shapes when it closes, whether Clear
+    took the area's old ones away, and whether In order is on."""
+
+    OTHER = "#b0b0b0"  # the area's shapes from before
+    NEW = "#ffffff"     # shapes drawn this time
+
+    def __init__(self, root, kind, shapes, on_done=None, plan=None, gap=10, accent="#4a8fd9",
+                 in_order=False):
+        super().__init__(root, accent)
+        self.kind, self.on_done, self.in_order = kind, on_done, in_order
+        self.existing = list(shapes)
+        self.added = []     # shapes drawn this time
+        self.cleared = False  # Clear took the area's old shapes away
+        self.history = []   # what Undo takes back: ("add",) or ("clear", added, cleared)
+        self.start = None   # where a drag began
+        self.corners = []   # polygon corners so far
+        for shape in self.existing:
+            self.draw_outline(shape, self.OTHER if kind else self.NEW, "existing")
+        self.regions["existing"] = [r for s_ in self.existing for r in outline_rects(s_)]
+        self.redraw_numbers()
+        if kind is None:
+            every = self.show_spots(plan, gap) if plan is not None else 1
+            self.draw_message(
+                "These are the spots it will click" + (
+                    f" (every {every}{'nd' if every == 2 else 'rd' if every == 3 else 'th'} "
+                    "one each way: they're close together)" if every > 1 else "")
+                + "  ·  Click or press Esc to close")
+            self.bind_mouse(ButtonRelease_1=lambda e: self.close())
+            self.bind("<Escape>", lambda e: self.close())
+        else:
+            self.draw_bar()
+            self.bind_mouse(
+                ButtonPress_1=self.press, B1_Motion=self.drag, ButtonRelease_1=self.release,
+                Double_Button_1=lambda e: self.kind == "polygon" and self.finish_polygon(),
+                Motion=self.follow)
+            self.bind("<Return>", lambda e: self.finish_polygon())
+            self.bind("<KP_Enter>", lambda e: self.finish_polygon())
+            self.bind("<BackSpace>", lambda e: self.undo())
+            self.bind("<Escape>", lambda e: self.finish())
+            self.bind("<ButtonRelease-3>", lambda e: self.finish())
+        self.show_now()
+
+    # ---- drawing ----
+    def draw_outline(self, shape, color, tags):
+        draw_shape(self.canvas, shape, self.EDGE, width=5, tags=tags)
+        draw_shape(self.canvas, shape, color, width=2, tags=tags)
+
+    def draw_bar(self):
+        n = len(self.added)
+        if self.kind == "polygon":
+            hint = "Click each corner, then double-click or press Enter"
+        else:
+            hint = f"Drag to draw a {SHAPE_NAMES[self.kind].lower()}" + (
+                "  ·  Shift: a perfect circle" if self.kind == "circle" else
+                "  ·  Shift: a square" if self.kind == "rectangle" else
+                "  ·  drag upwards to point it down" if self.kind == "triangle" else "")
+        if self.cleared:
+            hint += "  ·  cleared" + (f", then {n} added" if n else " (Undo brings them back)")
+        elif n:
+            hint += f"  ·  {n} {'shape' if n == 1 else 'shapes'} added"
+        if self.in_order:
+            hint += "  ·  in order: one shape after another"
+        hint += "  ·  Done or Esc to finish"
+        self.draw_menu(list(SHAPE_NAMES) + ["order", "clear", "undo", "done"],
+                       dict(SHAPE_NAMES, order="In order: " + ("on" if self.in_order else "off"),
+                            clear="Clear", undo="Undo", done="Done"), hint,
+                       chosen=self.kind, gap_before="order", lit="order" if self.in_order
+                       else None)
+
+    def redraw_numbers(self):
+        """While In order is on: each shape's number (the order they're clicked in) in a
+        small accent-coloured circle on its top left corner."""
+        c, r = self.canvas, 11
+        c.delete("numbers")
+        rects = []
+        if self.in_order:
+            shapes = ([] if self.cleared else self.existing) + self.added
+            ink = text_on(self.accent)
+            for n, shape in enumerate(shapes, start=1):
+                x, y = shapes_box([shape])[:2]
+                c.create_oval(x - r, y - r, x + r, y + r, fill=self.accent, outline=self.EDGE,
+                              width=2, tags=("numbers", "accent_fill"))
+                c.create_text(x, y, text=str(n), fill=ink, tags=("numbers", "accent_ink"),
+                              font=("TkDefaultFont", 10 if n < 100 else 8, "bold"))
+                rects += rounded_rects(x - r - 1, y - r - 1, 2 * r + 3, 2 * r + 3, r + 1)
+        self.regions["numbers"] = rects
+        c.tag_raise("numbers")
+        c.tag_raise("bar")
+        self.show_regions()
+
+    def show_spots(self, plan, gap, most=2500):
+        """A small dot in the accent colour on each spot. If they're very close together or
+        there are very many, only every nth one each way, so it stays clear (returns n).
+        (Each dot is a piece of the window's shape; with thousands of pieces the desktop
+        draws it wrongly and slowly, so there are never more than `most`.)"""
+        left, top = shapes_box(self.existing)[:2]
+        every = max(1, math.ceil(10 / gap))  # dots at least 10 pixels apart
+        while True:
+            chosen = [(x, y) for y, xs in plan.rows if (y - top) // gap % every == 0
+                      for x in xs if (x - left) // gap % every == 0]
+            if len(chosen) <= most:
+                break
+            every += 1
+        rects = []
+        edge = self.ACCENT_TAGS["accent_edge"][1](self.accent)
+        for x, y in chosen:  # an accent dot with a darker edge (shows on any screen)
+            self.canvas.create_rectangle(x - 2, y - 2, x + 2, y + 2, fill=self.accent,
+                                         outline=edge, tags=("accent_fill", "accent_edge"))
+            rects.append((x - 2, y - 2, 5, 5))
+        self.regions["spots"] = rects
+        return every
+
+    def bar_pressed(self, name):
+        if name == "done":
+            self.finish()
+        elif name == "undo":
+            self.undo()
+        elif name == "clear":
+            self.clear()
+        elif name == "order":
+            self.in_order = not self.in_order
+            self.redraw_numbers()
+            self.draw_bar()
+        else:
+            self.kind = name
+            self.corners = []
+            self.clear_new()
+            self.draw_bar()
+
+    def clear_new(self):
+        self.canvas.delete("new")
+        self.regions["new"] = []
+        self.show_regions()
+
+    def undo(self):
+        """Take off the polygon's last corner, or else the last shape drawn (or Clear)."""
+        if self.corners:
+            self.corners.pop()
+            self.redraw_polygon(self.winfo_pointerxy())
+            return
+        if not self.history:
+            return
+        step = self.history.pop()
+        if step[0] == "add":
+            self.added.pop()
+        else:  # bring back what Clear took away
+            self.added, self.cleared = step[1], step[2]
+            self.redraw_existing()
+        self.redraw_added()
+        self.draw_bar()
+
+    def clear(self):
+        """Take every shape away: the area's old ones and the ones drawn this time."""
+        if self.corners:
+            self.corners = []
+            self.clear_new()
+        if not self.added and (self.cleared or not self.existing):
+            return  # nothing to clear
+        self.history.append(("clear", list(self.added), self.cleared))
+        self.added, self.cleared = [], True
+        self.redraw_existing()
+        self.redraw_added()
+        self.draw_bar()
+
+    def redraw_existing(self):
+        """The area's shapes from before (unless Clear took them away)."""
+        self.canvas.delete("existing")
+        shown = [] if self.cleared else self.existing
+        for shape in shown:
+            self.draw_outline(shape, self.OTHER, "existing")
+        self.regions["existing"] = [r for s_ in shown for r in outline_rects(s_)]
+        self.canvas.tag_raise("added")
+        self.redraw_numbers()
+
+    def redraw_added(self):
+        self.canvas.delete("added")
+        for shape in self.added:
+            self.draw_outline(shape, self.NEW, "added")
+        self.regions["added"] = [r for s_ in self.added for r in outline_rects(s_)]
+        self.redraw_numbers()
+
+    def add(self, shape):
+        self.added.append(shape)
+        self.history.append(("add",))
+        self.clear_new()
+        self.redraw_added()
+        self.draw_bar()
+
+    def finish(self):
+        added, cleared = list(self.added), self.cleared
+        self.close()
+        if self.on_done:
+            self.on_done(added, cleared, self.in_order)
+
+    # ---- the mouse ----
+    def press(self, event):
+        # (a menu button works when it's let go of, like any button, so the release never
+        # lands on the window underneath once Done has closed this)
+        self.bar_down = self.on_bar(event)
+        if self.bar_down:
+            self.start = None
+            return
+        if self.kind != "polygon":
+            self.start = (event.x_root, event.y_root)
+
+    def drag(self, event):
+        if self.start is None:
+            return
+        self.canvas.delete("new")
+        shape = self.shape_from(event)
+        self.regions["new"] = []
+        if shape:
+            self.draw_outline(shape, self.NEW, "new")
+            left, top, right, bottom = shapes_box([shape])
+            label_y = bottom + 22 if bottom + 44 < self.height else top - 22
+            label = self.canvas.create_text((left + right) / 2, label_y, fill="#ffffff",
+                                            text=f"{right - left} × {bottom - top}",
+                                            font=("TkDefaultFont", 12, "bold"), tags="new")
+            x1, y1, x2, y2 = self.canvas.bbox(label)
+            self.canvas.create_rectangle(x1 - 6, y1 - 3, x2 + 6, y2 + 3, fill=self.PANEL,
+                                         outline="", tags="new")
+            self.canvas.tag_raise(label)
+            self.regions["new"] = outline_rects(shape) + [(x1 - 6, y1 - 3, x2 - x1 + 13,
+                                                           y2 - y1 + 7)]
+        self.show_regions()
+
+    def release(self, event):
+        down, self.bar_down = self.bar_down, None
+        if down or self.on_bar(event):
+            if down and down == self.on_bar(event):
+                self.bar_pressed(down)
+            return
+        if self.kind == "polygon":
+            self.add_corner(event)
+            return
+        if self.start is None:
+            return
+        shape = self.shape_from(event)
+        self.start = None
+        if shape is None:
+            self.clear_new()  # just a click, not a shape: keep waiting
+            return
+        left, top, right, bottom = shapes_box([shape])
+        if min(right - left, bottom - top) < 2:
+            self.clear_new()
+            return
+        self.add(shape)
+
+    def shape_from(self, event):
+        (x1, y1), x2, y2 = self.start, event.x_root, event.y_root
+        if event.state & 0x1 and self.kind in ("rectangle", "circle"):  # Shift: even sides
+            side = max(abs(x2 - x1), abs(y2 - y1))
+            x2 = x1 + side * (1 if x2 >= x1 else -1)
+            y2 = y1 + side * (1 if y2 >= y1 else -1)
+        if self.kind == "triangle":
+            left, right = min(x1, x2), max(x1, x2)
+            top, bottom = min(y1, y2), max(y1, y2)
+            middle = (left + right) // 2
+            points = ([middle, top, left, bottom, right, bottom] if y2 >= y1
+                      else [left, top, right, top, middle, bottom])  # dragged up: points down
+        else:
+            points = [x1, y1, x2, y2]
+        return clean_shape({"type": self.kind, "points": points})
+
+    # ---- polygons: click the corners ----
+    def add_corner(self, event):
+        point = (event.x_root, event.y_root)
+        if self.corners and self.corners[-1] == point:
+            return  # (the second click of a double-click)
+        self.corners.append(point)
+        self.redraw_polygon(point)
+
+    def follow(self, event):
+        if self.kind == "polygon" and self.corners:
+            self.redraw_polygon((event.x_root, event.y_root))
+
+    def redraw_polygon(self, pointer):
+        c = self.canvas
+        c.delete("new")
+        points = self.corners + [tuple(pointer)]
+        line = [v for point in points for v in point]
+        if len(line) >= 4:
+            c.create_line(*line, fill=self.EDGE, width=5, tags="new")
+            c.create_line(*line, fill=self.NEW, width=2, tags="new")
+        for x, y in self.corners:
+            c.create_oval(x - 5, y - 5, x + 5, y + 5, fill=self.NEW, outline=self.EDGE,
+                          width=2, tags="new")
+        self.regions["new"] = (line_rects(points) if len(points) > 1 else []) + [
+            (x - 6, y - 6, 13, 13) for x, y in self.corners]
+        c.tag_raise("bar")
+        self.show_regions()
+
+    def finish_polygon(self):
+        if self.kind != "polygon":
+            return
+        shape = clean_shape({"type": "polygon",
+                             "points": [v for point in self.corners for v in point]})
+        if shape is None:
+            return  # needs at least 3 corners
+        if len(self.corners) == 3:
+            shape["type"] = "triangle"
+        self.corners = []
+        self.add(shape)
+
+
+class MacroRecorder(ScreenLayer):
+    """The Macros menu: a see-through layer over the whole screen (see ScreenLayer) for
+    choosing where a macro clicks. Click anywhere with the left, right or middle button to
+    add that click there. Each click shows as a circle in the accent colour with its
+    letter and number: L1 is a left click and the first click, R2 a right click and the
+    second, and so on. Drag a circle to move it. Clear takes every click away, Undo takes
+    back the last thing done, and Done (or Esc / Enter) finishes.
+    show_only=True just shows the clicks (click to close).
+    on_done(clicks) gets the macro's clicks when it closes."""
+
+    R = 14           # the circles' radius
+    MOVE_FROM = 5    # pixels: dragging a circle further than this moves it
+
+    def __init__(self, root, clicks, on_done=None, accent="#4a8fd9", show_only=False):
+        super().__init__(root, accent)
+        self.clicks = [dict(c) for c in clicks]
+        self.on_done = on_done
+        self.history = []   # what Undo takes back: a copy of the clicks before each change
+        self.down = None    # (button, x, y, index of the circle pressed on, or None)
+        self.dragged = False
+        self.redraw_clicks()
+        if show_only:
+            n = len(self.clicks)
+            self.draw_message(f"The macro's {n} {'click' if n == 1 else 'clicks'}, in order"
+                              "  ·  Click or press Esc to close")
+            for number in (1, 2, 3):
+                self.bind_mouse(**{f"ButtonRelease_{number}": lambda e: self.close()})
+            self.bind("<Escape>", lambda e: self.close())
+        else:
+            self.draw_bar()
+            for number in (1, 2, 3):
+                self.bind_mouse(**{f"ButtonPress_{number}": self.press,
+                                   f"B{number}_Motion": self.drag,
+                                   f"ButtonRelease_{number}": self.release})
+            self.bind("<BackSpace>", lambda e: self.undo())
+            for key in ("<Escape>", "<Return>", "<KP_Enter>"):
+                self.bind(key, lambda e: self.finish())
+        self.show_now()
+
+    # ---- drawing ----
+    def spot_of(self, i):
+        """Where click i's circle goes: on its spot, or beside it if an earlier click is
+        on the same spot (a double click, say), so every label can be read."""
+        click = self.clicks[i]
+        same = sum(1 for c in self.clicks[:i]
+                   if abs(c["x"] - click["x"]) <= 2 and abs(c["y"] - click["y"]) <= 2)
+        return click["x"] + same * (2 * self.R + 4), click["y"]
+
+    def redraw_clicks(self):
+        c, r = self.canvas, self.R
+        c.delete("clicks")
+        rects = []
+        font = ("TkDefaultFont", 10, "bold")
+        small = ("TkDefaultFont", 8, "bold")
+        ink = text_on(self.accent)
+        # the arrows first, so the circles go over their ends (and leave room for the circles
+        # in the window's shape)
+        per_circle = len(rounded_rects(0, 0, 2 * r + 3, 2 * r + 3, r + 1))
+        rects += self.draw_arrows(self.SHAPE_PIECES_MAX - per_circle * len(self.clicks))
+        for i, click in enumerate(self.clicks):
+            x, y = self.spot_of(i)
+            c.create_oval(x - r, y - r, x + r, y + r, fill=self.accent, outline=self.EDGE,
+                          width=2, tags=("clicks", "accent_fill"))
+            label = macro_label(i, click)
+            c.create_text(x, y, text=label, font=font if len(label) <= 3 else small,
+                          fill=ink, tags=("clicks", "accent_ink"))
+            rects += rounded_rects(x - r - 1, y - r - 1, 2 * r + 3, 2 * r + 3, r + 1)
+        self.regions["clicks"] = rects
+        c.tag_raise("bar")
+        self.show_regions()
+
+    ARROW_HEAD = (16, 9)    # the arrowheads' length and half width
+    SHAPE_PIECES_MAX = 4000  # more pieces of the window's shape than this and the desktop
+                             # draws it wrongly (see WindowShape): very many long arrows
+                             # would need more, so the last ones aren't drawn
+
+    def draw_arrows(self, most):
+        """An arrow from each click's circle to the next one's (1 to 2, 2 to 3...), in the
+        accent colour with a dark edge. Returns the rectangles that show them (at most
+        `most`)."""
+        c, rects = self.canvas, []
+        length, half = self.ARROW_HEAD
+        for i in range(len(self.clicks) - 1):
+            (xa, ya), (xb, yb) = self.spot_of(i), self.spot_of(i + 1)
+            d = math.hypot(xb - xa, yb - ya)
+            gap = self.R + 5  # from just outside one circle to just outside the next
+            if d < 2 * gap + length + 4:
+                continue  # (too close together for an arrow to show)
+            ux, uy = (xb - xa) / d, (yb - ya) / d
+            start = (xa + ux * gap, ya + uy * gap)
+            tip = (xb - ux * gap, yb - uy * gap)
+            base = (tip[0] - ux * length, tip[1] - uy * length)
+            head = [tip[0], tip[1], base[0] - uy * half, base[1] + ux * half,
+                    base[0] + uy * half, base[1] - ux * half]
+            line = [start, (base[0] + ux * 2, base[1] + uy * 2)]
+            new = self.line_rects(line) + self.triangle_rects(head)
+            if len(rects) + len(new) > most:
+                break
+            rects += new
+            flat = [v for point in line for v in point]
+            c.create_line(*flat, fill=self.EDGE, width=7, tags="clicks")
+            c.create_line(*flat, fill=self.accent, width=3, tags=("clicks", "accent_fill"))
+            c.create_polygon(head, fill=self.accent, outline=self.EDGE, width=2,
+                             tags=("clicks", "accent_fill"))
+        return rects
+
+    @staticmethod
+    def line_rects(points, pad=4, step=5):
+        """Fewer rectangles than line_rects() for one thick line (7 pixels): squares along
+        it, with squares in the same row (or column) joined into one, so a flat line
+        needs very few."""
+        (xa, ya), (xb, yb) = points
+        flat = abs(xb - xa) >= abs(yb - ya)
+        n = max(1, int(math.hypot(xb - xa, yb - ya) / step))
+        size, rects = 2 * pad + 1, []
+        for i in range(n + 1):
+            x = int(round(xa + (xb - xa) * i / n)) - pad
+            y = int(round(ya + (yb - ya) * i / n)) - pad
+            if rects:
+                lx, ly, lw, lh = rects[-1]
+                if flat and y == ly:  # same row: make the last one longer
+                    left = min(lx, x)
+                    rects[-1] = (left, ly, max(lx + lw, x + size) - left, lh)
+                    continue
+                if not flat and x == lx:  # same column
+                    top = min(ly, y)
+                    rects[-1] = (lx, top, lw, max(ly + lh, y + size) - top)
+                    continue
+            rects.append((x, y, size, size))
+        return rects
+
+    @staticmethod
+    def triangle_rects(points):
+        """Rows of rectangles covering a triangle and a 2-pixel edge round it."""
+        triangle = {"type": "triangle", "points": points}
+        ys = points[1::2]
+        top, bottom = math.floor(min(ys)), math.ceil(max(ys))
+        rects = []
+        for y in range(top - 2, bottom + 3):
+            for a, b in shape_spans(triangle, min(max(y, top), bottom)):
+                rects.append((math.floor(a) - 2, y, math.ceil(b - a) + 5, 1))
+        return rects
+
+    def draw_bar(self):
+        n = len(self.clicks)
+        hint = "Click where it should click (left, right or middle button)"
+        if n:
+            hint += "  ·  drag a circle to move it"
+        hint += f"  ·  {n} {'click' if n == 1 else 'clicks'}"
+        if n >= MACRO_MAX:
+            hint += " (the most it can have)"
+        hint += "  ·  Done or Esc to finish"
+        self.draw_menu(["clear", "undo", "done"],
+                       {"clear": "Clear", "undo": "Undo", "done": "Done"}, hint)
+
+    def bar_pressed(self, name):
+        if name == "done":
+            self.finish()
+        elif name == "undo":
+            self.undo()
+        elif name == "clear" and self.clicks:
+            self.change(self.clicks.clear)
+
+    # ---- changes ----
+    def change(self, how):
+        """Make a change to the clicks that Undo can take back."""
+        self.history.append([dict(c) for c in self.clicks])
+        how()
+        self.redraw_clicks()
+        self.draw_bar()
+
+    def undo(self):
+        if self.history:
+            self.clicks = self.history.pop()
+            self.redraw_clicks()
+            self.draw_bar()
+
+    def finish(self):
+        clicks = list(self.clicks)
+        self.close()
+        if self.on_done:
+            self.on_done(clicks)
+
+    # ---- the mouse ----
+    def circle_at(self, x, y):
+        """The click whose circle is under the mouse (the top one), or None."""
+        for i in reversed(range(len(self.clicks))):
+            cx, cy = self.spot_of(i)
+            if math.hypot(x - cx, y - cy) <= self.R + 2:
+                return i
+        return None
+
+    def press(self, event):
+        # (a menu button works when it's let go of, like any button, so the release never
+        # lands on the window underneath once Done has closed this)
+        on_bar = self.on_bar(event)
+        if on_bar or self.down is not None or self.bar_down:
+            if on_bar and event.num == 1 and self.down is None:
+                self.bar_down = on_bar
+            return
+        x, y = event.x_root, event.y_root
+        self.down = (event.num, x, y, self.circle_at(x, y))
+        self.dragged = False
+
+    def drag(self, event):
+        if self.down is None or self.down[3] is None:
+            return
+        _button, x0, y0, i = self.down
+        dx, dy = event.x_root - x0, event.y_root - y0
+        if not self.dragged and math.hypot(dx, dy) <= self.MOVE_FROM:
+            return
+        if not self.dragged:  # starting to move it: Undo puts it back
+            self.history.append([dict(c) for c in self.clicks])
+            self.dragged = True
+        was = self.history[-1][i]  # where it was before the drag
+        self.clicks[i]["x"], self.clicks[i]["y"] = was["x"] + dx, was["y"] + dy
+        self.redraw_clicks()
+
+    def release(self, event):
+        if self.bar_down and event.num == 1:
+            name, self.bar_down = self.bar_down, None
+            if name == self.on_bar(event):
+                self.bar_pressed(name)
+            return
+        if self.down is None or self.down[0] != event.num:
+            return
+        number, x, y, _i = self.down
+        self.down = None
+        if self.dragged:
+            self.dragged = False
+            self.draw_bar()
+            return
+        if self.on_bar(event) or len(self.clicks) >= MACRO_MAX:
+            return  # (let go on the menu: not a click)
+        button = {1: "Left", 2: "Middle", 3: "Right"}[number]
+        self.change(lambda: self.clicks.append({"button": button, "x": x, "y": y}))
+
+
 class RecordingEditor(tk.Toplevel):
     """Edit the current recording as text, one input per line (the same style as the
     profile files). Lines that don't make sense are skipped when you save."""
@@ -2830,7 +4336,7 @@ class RecordingEditor(tk.Toplevel):
         self.configure(bg=p["bg"])
         self.geometry("560x560")
         self.minsize(420, 360)
-        self.transient(parent)
+        keep_above(self, parent)
         body = tk.Frame(self, bg=p["bg"], padx=16, pady=14)
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
@@ -2882,6 +4388,17 @@ class RecordingEditor(tk.Toplevel):
         self.on_save(recording, skipped)
 
 
+def keep_above(popup, parent):
+    """A pop-up window stays in front of the app, even when the app is kept on top
+    (Keep window on top, or mini mode): otherwise it could open hidden behind it."""
+    popup.transient(parent)
+    try:
+        if parent.attributes("-topmost"):
+            popup.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+
+
 class SmallDialog(tk.Toplevel):
     """A small window with a message, an optional name box, and buttons.
 
@@ -2896,7 +4413,7 @@ class SmallDialog(tk.Toplevel):
         self.title(title)
         self.configure(bg=p["bg"])
         self.resizable(False, False)
-        self.transient(parent)
+        keep_above(self, parent)
         body = tk.Frame(self, bg=p["bg"], padx=18, pady=16)
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
@@ -2913,7 +4430,8 @@ class SmallDialog(tk.Toplevel):
             self.after(50, entry.entry.focus_set)
         self.message = tk.Label(body, text="", bg=p["bg"], fg=p["muted"], anchor="w",
                                 wraplength=340, justify="left")
-        self.message.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.message.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.message.grid_remove()  # only shown when there's something to say
         buttons = []
         if name is not None:
             buttons.append(RoundedButton(body, "Cancel", self.destroy, height=34))
@@ -2938,7 +4456,8 @@ class SmallDialog(tk.Toplevel):
     def confirm(self):
         problem = self.ok(self.name.get() if self.name else None) if self.ok else None
         if problem:
-            self.message.configure(text=problem, pady=4)
+            self.message.configure(text=problem)
+            self.message.grid()
         else:
             self.destroy()
 
@@ -3081,7 +4600,7 @@ class ScrollArea(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
         self.canvas = tk.Canvas(self, highlightthickness=0, bd=0, yscrollincrement=1)
-        self.bar = RoundedScrollbar(self, command=self.canvas.yview)
+        self.bar = RoundedScrollbar(self, command=self.bar_moved)
         self.inner = ttk.Frame(self.canvas)
         self.window = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
         self.canvas.configure(yscrollcommand=self.bar.set)
@@ -3156,6 +4675,13 @@ class ScrollArea(ttk.Frame):
 
     WHEEL_STEP = 60   # pixels per notch of the mouse wheel
     GLIDE_MS = 10     # time between frames of the glide
+
+    def bar_moved(self, *args):
+        """The scroll bar was dragged or clicked: that wins over any wheel glide."""
+        if self.glide_job is not None:
+            self.after_cancel(self.glide_job)
+            self.glide_job = None
+        self.canvas.yview(*args)
 
     def glide_by(self, pixels):
         """Scroll smoothly: each frame covers part of the way left, so it starts quick and
@@ -3298,14 +4824,40 @@ class Pointer:
         from Xlib import X
         from Xlib.ext import xtest
         xtest.fake_input(self.display, X.MotionNotify, detail=1, x=int(dx), y=int(dy))
-        self.display.flush()
+        self.display.sync()
+
+    def position(self):
+        """Where the pointer is now."""
+        if self.connect() is None:
+            return tuple(int(v) for v in self.fallback.position)
+        reply = self.root.query_pointer()
+        return reply.root_x, reply.root_y
+
+    def click_at(self, x, y, button, count, back):
+        """Jump to x, y, click `button` (1 left, 2 middle, 3 right) `count` times, and jump
+        back to `back`, all in one go. One connection keeps them in order, so it only has
+        to wait once at the end (much quicker than waiting after each step). Returns False
+        if it can't (then click the slower way)."""
+        if self.connect() is None:
+            return False
+        from Xlib import X
+        from Xlib.ext import xtest
+        self.root.warp_pointer(int(x), int(y))
+        for _ in range(count):
+            xtest.fake_input(self.display, X.ButtonPress, button)
+            xtest.fake_input(self.display, X.ButtonRelease, button)
+        self.root.warp_pointer(int(back[0]), int(back[1]))
+        self.display.sync()
+        return True
 
     def place(self, x, y):
         if self.connect() is None:
             self.fallback.position = (x, y)
             return
         self.root.warp_pointer(int(x), int(y))
-        self.display.flush()
+        # wait until it has really moved: clicks go through a different connection, and
+        # could otherwise land before the pointer gets there
+        self.display.sync()
 
 
 class RawMotion:
@@ -3453,6 +5005,8 @@ class AutoClicker:
         self.last_synthetic = {}  # input code -> time of our last automatic press of it
         self.last_input = {}      # input code -> time it was last pressed
         self.anchor = None        # where the mouse was when clicking began (for auto stop)
+        self.home_pos = None      # where area clicks put the mouse back to (see tap)
+        self.own_windows = []     # where the app's own windows are (see note_own_windows)
         self.held = []            # what Hold mode is holding down right now: (kind, thing)
         self.held_codes = set()
         self.hold_lock = threading.Lock()
@@ -3487,6 +5041,17 @@ class AutoClicker:
 
         saved = load_settings()
         self.locations = saved["locations"] or []  # click spots: one, or several in a row
+        self.area = list(saved["area"])            # the shapes "Click across an area" clicks
+        self.area_plan = None                      # AreaPlan for self.area, see area_plan_now
+        self.shape_rows = []                       # the Areas page's list of shapes
+        self.clear_shapes_job = None               # "Sure?" on Clear all, see clear_shapes
+        self.area_choice = tk.StringVar(value=next(iter(list_areas()), ""))  # saved areas list
+        self.area_name = tk.StringVar()            # the "Save these shapes as" box
+        self.macro = list(saved["macro"])          # the macro's clicks, in order
+        self.click_rows = []                       # the Macros page's list of clicks
+        self.clear_macro_job = None                # "Sure?" on Clear all, see clear_macro
+        self.macro_choice = tk.StringVar(value=next(iter(list_macros()), ""))
+        self.macro_name = tk.StringVar()           # the "Save these clicks as" box
         self.profile_hotkeys = {}                  # hotkey code -> profile name
         self.hotkey_var_busy = False               # True while showing a profile's hotkey
         self.badge = None                          # the floating running indicator
@@ -3509,6 +5074,8 @@ class AutoClicker:
             self.root.after(600, self.warn_wayland)
         # look up the monitors now, so the first dropdown opens straight away
         threading.Thread(target=screen_areas, daemon=True).start()
+        if self.check_updates.get():
+            self.root.after(4000, self.look_for_update)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.poll()
         self.root.after(0, self.reveal)
@@ -3589,11 +5156,11 @@ class AutoClicker:
                 tkfont.nametofont(name).configure(family=family, size=FONT_SIZE)
             except tk.TclError:
                 pass
-        self.font_family = family
         self.font_title = tkfont.Font(family=family, size=FONT_SIZE + 5, weight="bold")
         self.font_brand = tkfont.Font(family=family, size=FONT_SIZE + 1, weight="bold")
         self.font_section = tkfont.Font(family=family, size=FONT_SIZE + 1, weight="bold")
         self.font_caption = tkfont.Font(family=family, size=FONT_SIZE - 1, weight="bold")
+        self.font_badge_small = tkfont.Font(family=family, size=FONT_SIZE - 3, weight="bold")
         self.font_nav = tkfont.Font(family=family, size=FONT_SIZE)  # menu buttons
 
     # ---------------- UI ----------------
@@ -3610,8 +5177,19 @@ class AutoClicker:
         self.time_limit = tk.DoubleVar(value=saved["time_limit"])
         self.delay = tk.DoubleVar(value=saved["delay"])
         self.location_on = tk.BooleanVar(value=saved["location_on"])
+        self.area_on = tk.BooleanVar(value=saved["area_on"] and not saved["location_on"])
+        self.area_gap = tk.IntVar(value=saved["area_gap"])
+        self.area_return = tk.BooleanVar(value=saved["area_return"])
+        self.area_in_order = tk.BooleanVar(value=saved["area_in_order"])
         self.multi_location = tk.BooleanVar(value=saved["multi_location"])
         self.hold = tk.BooleanVar(value=saved["hold"])
+        # Macros
+        self.macro_wait = tk.DoubleVar(value=saved["macro_wait"])
+        self.macro_delay = tk.DoubleVar(value=saved["macro_delay"])
+        self.macro_loop = tk.BooleanVar(value=saved["macro_loop"])
+        self.macro_limit_on = tk.BooleanVar(value=saved["macro_limit_on"])
+        self.macro_limit = tk.IntVar(value=saved["macro_limit"])
+        self.macro_return = tk.BooleanVar(value=saved["macro_return"])
         # Keyboard clicker
         self.kb_key = tk.StringVar(value=saved["kb_key"])
         self.kb_cps = tk.DoubleVar(value=saved["kb_cps"])
@@ -3638,6 +5216,7 @@ class AutoClicker:
         self.hotkey = tk.StringVar(value=saved["hotkey"])
         self.location_key = tk.StringVar(value=saved["location_key"])
         self.record_key = tk.StringVar(value=saved["record_key"])
+        self.draw_key = tk.StringVar(value=saved["draw_key"])
         self.auto_stop = tk.BooleanVar(value=saved["auto_stop"])
         self.on_top = tk.BooleanVar(value=saved["always_on_top"])
         self.mini = tk.BooleanVar(value=saved["mini_mode"])
@@ -3654,6 +5233,8 @@ class AutoClicker:
         self.badge_corner = tk.StringVar(value=saved["badge_corner"])
         self.finish_sound = tk.BooleanVar(value=saved["finish_sound"])
         self.countdown = tk.BooleanVar(value=saved["countdown"])
+        self.check_updates = tk.BooleanVar(value=saved["check_updates"])
+        self.newer_version = None  # (tag, page) once a newer release has been found
         self.begin_at = 0.0  # when the start delay ends (for the countdown)
         self.text_size = tk.StringVar(value=saved["text_size"])
         self.dark = tk.BooleanVar(value=saved["dark_mode"])
@@ -3678,6 +5259,11 @@ class AutoClicker:
             "record_keys_only": self.record_keys_only, "record_moves": self.record_moves,
             "record_repeats": self.record_repeats, "record_accuracy": self.record_accuracy,
             "multi_location": self.multi_location,
+            "area_on": self.area_on, "area_gap": self.area_gap,
+            "area_return": self.area_return, "area_in_order": self.area_in_order,
+            "macro_wait": self.macro_wait, "macro_delay": self.macro_delay,
+            "macro_loop": self.macro_loop, "macro_limit_on": self.macro_limit_on,
+            "macro_limit": self.macro_limit, "macro_return": self.macro_return,
         }
 
         # Apply the starting colours instantly (no animation on launch)
@@ -3687,6 +5273,7 @@ class AutoClicker:
         self.hotkey.trace_add("write", lambda *_: self.refresh_button())
         self.location_key.trace_add("write", lambda *_: self.refresh_location())
         self.record_key.trace_add("write", lambda *_: self.refresh_recording_info())
+        self.draw_key.trace_add("write", lambda *_: self.refresh_draw_button())
         self.on_top.trace_add("write", lambda *_: self.apply_on_top())
         self.badge_show.trace_add("write", lambda *_: (self.refresh_running(),
                                                         self.show_optional_rows(),
@@ -3697,10 +5284,20 @@ class AutoClicker:
         self.finish_sound.trace_add("write", lambda *_: self.save_settings())
         self.countdown.trace_add("write", lambda *_: (self.refresh_running(),
                                                        self.save_settings()))
+        self.check_updates.trace_add("write", lambda *_: self.save_settings())
         self.text_size.trace_add("write", lambda *_: (self.apply_text_size(), self.save_settings()))
         self.profile_hotkey.trace_add("write", lambda *_: self.on_profile_hotkey_set())
         for var in (self.location_on, self.multi_location):
             var.trace_add("write", lambda *_: self.refresh_location())
+        # Click at a set location and Click across an area can't both be on
+        self.location_on.trace_add("write", lambda *_: self.location_on.get()
+                                   and self.area_on.get() and self.area_on.set(False))
+        self.area_on.trace_add("write", lambda *_: self.area_on.get()
+                               and self.location_on.get() and self.location_on.set(False))
+        for var in (self.area_on, self.area_gap, self.area_in_order):
+            var.trace_add("write", lambda *_: self.refresh_area())
+        for var in (self.macro_wait, self.macro_loop, self.macro_limit_on, self.macro_limit):
+            var.trace_add("write", lambda *_: self.refresh_macro())
         self.dark.trace_add("write", lambda *_: self.animate_theme())
         self.accent.trace_add("write", lambda *_: self.animate_theme())
 
@@ -3714,8 +5311,8 @@ class AutoClicker:
 
         # Menu: logo, page buttons, then the status at the far end
         self.logo = self.register(Logo(sidebar, self.font_brand))
-        pages = (("clicker", "Mouse"), ("keyboard", "Keyboard"), ("recording", "Profiles"),
-                 ("settings", "Settings"))
+        pages = (("clicker", "Mouse"), ("areas", "Areas"), ("macros", "Macros"),
+                 ("keyboard", "Keyboard"), ("recording", "Profiles"), ("settings", "Settings"))
         # the page buttons sit together in a rounded card, with thin lines between them
         self.nav_card = self.register(Card(sidebar))
         self.nav_lines = []
@@ -3759,6 +5356,8 @@ class AutoClicker:
             self.pages[name] = frame
 
         self.build_clicker_page(self.pages["clicker"])
+        self.build_areas_page(self.pages["areas"])
+        self.build_macros_page(self.pages["macros"])
         self.build_keyboard_page(self.pages["keyboard"])
         self.build_recording_page(self.pages["recording"])
         self.build_settings_page(self.pages["settings"])
@@ -3769,7 +5368,7 @@ class AutoClicker:
         for var in (self.click_delay_on, self.limit_on, self.time_limit_on, self.location_on,
                     self.multi_location, self.hold, self.kb_limit_on, self.kb_time_limit_on,
                     self.kb_hold, self.replay_loop, self.replay_limit_on, self.record_keys_only,
-                    self.record_moves):
+                    self.record_moves, self.area_on, self.macro_loop, self.macro_limit_on):
             var.trace_add("write", lambda *_: self.show_optional_rows())
         self.show_optional_rows()
 
@@ -3777,6 +5376,8 @@ class AutoClicker:
         self.refresh_profile_list()
         self.refresh_button()
         self.refresh_location()
+        self.refresh_area()
+        self.refresh_macro()
         self.refresh_recording_info()
         self.apply_on_top()
         self.bind_page_shortcuts()
@@ -3906,16 +5507,17 @@ class AutoClicker:
     def flow_label(label, reserve=0, most=500):
         """Make a label's text wrap to fit the page (up to `most` pixels wide), leaving
         `reserve` pixels for whatever sits beside it."""
+        # (8: the label's own padding sits outside its wrap width)
         label.master.bind("<Configure>", lambda e: label.configure(
-            wraplength=max(150, min(most, e.width - reserve))), add="+")
+            wraplength=max(150, min(most, e.width - reserve - 8))), add="+")
         return label
 
     def button_group(self, parent, buttons):
         """Small buttons side by side, for the end of a card row."""
         frame = tk.Frame(parent, bd=0, highlightthickness=0, bg=self.palette["card"])
         self.card_frames.append(frame)
-        for i, (text, command) in enumerate(buttons):
-            self.make_button(frame, text, command, height=28, width=64).grid(
+        for i, (text, command, *width) in enumerate(buttons):  # (text, command[, width])
+            self.make_button(frame, text, command, height=28, width=(width or [64])[0]).grid(
                 row=0, column=i, padx=(0 if i == 0 else 6, 0))
         return frame
 
@@ -4131,9 +5733,9 @@ class AutoClicker:
         # Main settings side by side. "Wait" takes the place of clicks per second
         # while Click delay is on.
         self.field_columns(sub, 0, [
-            ("Clicks per second", lambda p: self.make_spin(p, self.cps, 0.1, 100, 1),
+            ("Clicks per second", lambda p: self.make_spin(p, self.cps, 0.1, MAX_CPS, 1),
              lambda: clicking() and not self.click_delay_on.get()),
-            ("Wait (seconds)", lambda p: self.make_spin(p, self.click_delay, 0.1, 3600, 0.5),
+            ("Wait (seconds)", lambda p: self.make_spin(p, self.click_delay, 0.001, 3600, 0.5),
              lambda: clicking() and self.click_delay_on.get()),
             ("Mouse button", lambda p: self.make_combo(p, self.button, list(BUTTONS)), None),
             ("Click type", lambda p: self.make_combo(p, self.click_type, list(CLICK_TYPES)),
@@ -4159,6 +5761,11 @@ class AutoClicker:
                       value=lambda p: self.button_group(p, [("Clear", self.clear_locations)]),
                       value_show=self.multi_location.get,
                       show=lambda: self.location_on.get() and not self.hold.get())
+        # Click across an area: the shapes are set up on the Areas page
+        _, self.area_hint, _ = self.card_row(
+            card, "Click across an area", self.area_on, subtitle="",
+            value=lambda p: self.button_group(p, [("Edit", lambda: self.go_to("areas"))]),
+            show=clicking)
 
         card = self.card_section(sub, 3, "Stopping")
         self.card_row(card, "After a number of clicks", self.limit_on,
@@ -4173,6 +5780,168 @@ class AutoClicker:
                                            accent=True)
         self.toggle_btn.grid(row=2, column=0, sticky="ew", pady=(14, 0))
 
+    def build_areas_page(self, frame):
+        """Shapes drawn on the screen; the mouse clicker clicks every spot inside them."""
+        sub = self.page_body(frame, "Areas")
+        draw = self.draw_btn = self.make_button(sub, "Draw shapes", self.draw_new_shape,
+                                                height=FIELD_HEIGHT + 4, selectable=True,
+                                                accent=True)
+        draw.set_selected(True)  # the main thing to press here: in the accent colour
+        self.refresh_draw_button()
+        draw.grid(row=1, column=0, sticky="ew")
+        self.flow_label(ttk.Label(
+            sub, style="Muted.TLabel", justify="left", wraplength=500,
+            text="Opens a menu at the top of your screen (its key works anywhere, even in a "
+                 "game): pick Rectangle, Circle, Triangle or Polygon and draw on the screen, as "
+                 "many as you like, then press Done. "
+                 "Every spot inside your shapes gets clicked, row by row.")).grid(
+            row=2, column=0, sticky="w", pady=(6, 0))
+
+        # the shapes so far, each with a Remove button (see refresh_shape_list)
+        ttk.Label(sub, text="Shapes", style="Caption.TLabel").grid(
+            row=3, column=0, sticky="w", pady=(14, 5))
+        self.shapes_card = self.register(Card(sub))
+        self.shapes_card.grid(row=4, column=0, sticky="ew")
+        shape_buttons = ttk.Frame(sub)
+        shape_buttons.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        shape_buttons.columnconfigure(0, weight=1)
+        shape_buttons.columnconfigure(1, weight=1)
+        self.make_button(shape_buttons, "Show spots", self.show_spots,
+                         height=FIELD_HEIGHT).grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self.clear_shapes_btn = self.make_button(shape_buttons, "Clear all", self.clear_shapes,
+                                                 height=FIELD_HEIGHT)
+        self.clear_shapes_btn.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+
+        card = self.card_section(sub, 6, "Clicking")
+        _, self.area_info, _ = self.card_row(card, "Click across this area", self.area_on,
+                                             subtitle="")
+        self.card_row(card, "Gap between clicks (pixels)",
+                      subtitle="Smaller means more clicks, closer together",
+                      value=lambda p: self.make_spin(p, self.area_gap, AREA_GAP_MIN,
+                                                     AREA_GAP_MAX, 1))
+        self.card_row(card, "Put the mouse back after each click", self.area_return,
+                      subtitle="It jumps to each spot, clicks and jumps straight back, so the "
+                               "mouse stays where you left it and you can keep using it")
+        self.card_row(card, "In order", self.area_in_order,
+                      subtitle="Click every spot in shape 1, then shape 2, and so on, instead "
+                               "of all the shapes together row by row. Also on the drawing menu.")
+        # ---- saving areas, the same way as profiles ----
+        self.libraries = {}
+        self.build_saved_section(sub, 8, "area", "Save these shapes as", "Area name",
+                                 "Saved areas", "No areas yet", self.area_choice,
+                                 self.area_name, list_areas, area_path, read_area, write_area,
+                                 current=lambda: ((self.area, self.area_gap_value(),
+                                                   bool(self.area_in_order.get()))
+                                                  if self.area else None),
+                                 apply=self.apply_area, empty="Add a shape first",
+                                 folder=areas_dir)
+
+        self.area_toggle_btn = self.make_button(frame, "", self.toggle, height=42,
+                                                selectable=True, accent=True)
+        self.area_toggle_btn.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+
+    def build_saved_section(self, sub, row, kind, save_text, placeholder, list_text,
+                            none_yet, choice, name, names, path, read, write, current, apply,
+                            empty, folder):
+        """The bottom of the Areas and Macros pages: save what's there now under a name,
+        then load, rename, duplicate or delete saved ones (like profiles). Uses grid rows
+        `row` to `row + 4`. How each kind is read and written goes in self.libraries."""
+        ttk.Label(sub, text=save_text).grid(row=row, column=0, sticky="w", pady=(16, 4))
+        save_row = ttk.Frame(sub)
+        save_row.grid(row=row + 1, column=0, sticky="ew", pady=(0, 10))
+        save_row.columnconfigure(0, weight=1)
+        self.register(RoundedEntry(save_row, name, placeholder,
+                                   on_enter=lambda: self.save_saved(kind))).grid(
+            row=0, column=0, sticky="ew")
+        self.make_button(save_row, "Save", lambda: self.save_saved(kind), height=FIELD_HEIGHT,
+                         width=90).grid(row=0, column=1, padx=(10, 0))
+        ttk.Label(sub, text=list_text).grid(row=row + 2, column=0, sticky="w", pady=(0, 4))
+        load_row = ttk.Frame(sub)
+        load_row.grid(row=row + 3, column=0, sticky="ew")
+        combo = self.make_combo(load_row, choice, names())
+        combo.placeholder = none_yet
+        combo.grid(row=0, column=0, columnspan=4, sticky="ew")
+        actions = [("Load", self.load_saved), ("Rename", self.rename_saved),
+                   ("Duplicate", self.duplicate_saved), ("Delete", self.delete_saved)]
+        for column, (text, command) in enumerate(actions):
+            load_row.columnconfigure(column, weight=1, uniform=f"{kind}_buttons")
+            button = self.make_button(load_row, text, lambda c=command: c(kind),
+                                      height=FIELD_HEIGHT, width=70)
+            button.grid(row=1, column=column, sticky="ew", pady=(8, 0),
+                        padx=(0 if column == 0 else 5, 0 if column == 3 else 5))
+        where = ttk.Frame(sub)
+        where.grid(row=row + 4, column=0, sticky="ew", pady=(8, 0))
+        where.columnconfigure(0, weight=1)
+        where_label = self.flow_label(
+            ttk.Label(where, text="", style="Muted.TLabel", justify="left", wraplength=360),
+            reserve=130, most=360)  # leaves room for the Open folder button
+        where_label.grid(row=0, column=0, sticky="w")
+        self.make_button(where, "Open folder", lambda: self.open_folder(folder()),
+                         height=FIELD_HEIGHT, width=110).grid(row=0, column=1, padx=(10, 0))
+        self.libraries[kind] = {
+            "a": "an area" if kind == "area" else f"a {kind}",  # "Type an area name first"
+            "choice": choice, "name": name, "list": names, "path": path, "read": read,
+            "write": write, "current": current, "apply": apply, "empty": empty,
+            "combo": combo, "delete_btn": button, "delete_job": None, "where": where_label}
+
+    def build_macros_page(self, frame):
+        """A macro: clicks set on the screen, clicked one after another in order."""
+        sub = self.page_body(frame, "Macros")
+        record = self.make_button(sub, "Record clicks", self.record_macro,
+                                  height=FIELD_HEIGHT + 4, selectable=True, accent=True)
+        record.set_selected(True)  # the main thing to press here: in the accent colour
+        record.grid(row=1, column=0, sticky="ew")
+        self.flow_label(ttk.Label(
+            sub, style="Muted.TLabel", justify="left", wraplength=500,
+            text="Opens a menu at the top of your screen: click anywhere with the left, right "
+                 "or middle mouse button to add a click there, as many as you like, then "
+                 "press Done. They're clicked one after another, in order: L1 is a left click "
+                 "and the first one, R2 a right click and the second.")).grid(
+            row=2, column=0, sticky="w", pady=(6, 0))
+
+        # the clicks so far, in order, each with a Remove button (see refresh_click_list)
+        ttk.Label(sub, text="Clicks", style="Caption.TLabel").grid(
+            row=3, column=0, sticky="w", pady=(14, 5))
+        self.clicks_card = self.register(Card(sub))
+        self.clicks_card.grid(row=4, column=0, sticky="ew")
+        click_buttons = ttk.Frame(sub)
+        click_buttons.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        click_buttons.columnconfigure(0, weight=1)
+        click_buttons.columnconfigure(1, weight=1)
+        self.make_button(click_buttons, "Show clicks", self.show_macro,
+                         height=FIELD_HEIGHT).grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self.clear_macro_btn = self.make_button(click_buttons, "Clear all", self.clear_macro,
+                                                height=FIELD_HEIGHT)
+        self.clear_macro_btn.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+
+        card = self.card_section(sub, 6, "Playing")
+        _, self.macro_info, _ = self.card_row(
+            card, "Wait between clicks (seconds)", subtitle="",
+            value=lambda p: self.make_spin(p, self.macro_wait, MACRO_WAIT_MIN, MACRO_WAIT_MAX,
+                                           0.1))
+        self.card_row(card, "Start delay (seconds)",
+                      value=lambda p: self.make_spin(p, self.macro_delay, 0, 60, 1))
+        self.card_row(card, "Play on a loop", self.macro_loop,
+                      subtitle="Start again from the first click after the last one")
+        self.card_row(card, "Stop after a number of plays", self.macro_limit_on,
+                      value=lambda p: self.make_spin(p, self.macro_limit, 1, 1000000, 1),
+                      value_show=self.macro_limit_on.get, show=self.macro_loop.get)
+        self.card_row(card, "Put the mouse back after each click", self.macro_return,
+                      subtitle="It jumps to each spot, clicks and jumps straight back, so the "
+                               "mouse stays where you left it and you can keep using it")
+        self.build_saved_section(sub, 8, "macro", "Save these clicks as", "Macro name",
+                                 "Saved macros", "No macros yet", self.macro_choice,
+                                 self.macro_name, list_macros, macro_path, read_macro,
+                                 write_macro,
+                                 current=lambda: ((self.macro, self.macro_wait_value())
+                                                  if self.macro else None),
+                                 apply=self.apply_macro, empty="Record some clicks first",
+                                 folder=macros_dir)
+
+        self.macro_toggle_btn = self.make_button(frame, "", self.toggle, height=42,
+                                                 selectable=True, accent=True)
+        self.macro_toggle_btn.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+
     def build_keyboard_page(self, frame):
         sub = self.page_body(frame, "Keyboard")
         pressing = lambda: not self.kb_hold.get()
@@ -4182,7 +5951,7 @@ class AutoClicker:
              lambda p: self.make_key_chooser(p, self.kb_key, "Keyboard clicker",
                                              is_keyboard_key, combos=True),
              None),
-            ("Presses per second", lambda p: self.make_spin(p, self.kb_cps, 0.1, 100, 1), pressing),
+            ("Presses per second", lambda p: self.make_spin(p, self.kb_cps, 0.1, MAX_CPS, 1), pressing),
             ("Start delay (s)", lambda p: self.make_spin(p, self.kb_delay, 0, 60, 1), None),
         ], columns=3)
         self.flow_label(ttk.Label(
@@ -4291,7 +6060,7 @@ class AutoClicker:
         self.card_row(card, "Stop after a number of plays", self.replay_limit_on,
                       value=lambda p: self.make_spin(p, self.replay_limit, 1, 100000, 1),
                       value_show=self.replay_limit_on.get, show=self.replay_loop.get)
-        self.card_row(card, "Speed", subtitle="2 plays it twice as fast, 0.5 at half speed",
+        self.card_row(card, "Speed", subtitle="2 is twice as fast, 0.5 is half speed",
                       value=lambda p: self.make_spin(p, self.replay_speed, SPEED_MIN,
                                                      SPEED_MAX, 0.25))
 
@@ -4319,9 +6088,9 @@ class AutoClicker:
         frame.columnconfigure(0, weight=1)
         clicking = lambda: not self.hold.get()
         self.field_columns(frame, 0, [
-            ("CPS", lambda p: self.make_spin(p, self.cps, 0.1, 100, 1),
+            ("CPS", lambda p: self.make_spin(p, self.cps, 0.1, MAX_CPS, 1),
              lambda: clicking() and not self.click_delay_on.get()),
-            ("Wait (s)", lambda p: self.make_spin(p, self.click_delay, 0.1, 3600, 0.5),
+            ("Wait (s)", lambda p: self.make_spin(p, self.click_delay, 0.001, 3600, 0.5),
              lambda: clicking() and self.click_delay_on.get()),
             ("Button", lambda p: self.make_combo(p, self.button, list(BUTTONS), width=70), None),
             ("Type", lambda p: self.make_combo(p, self.click_type, list(CLICK_TYPES), width=70),
@@ -4456,10 +6225,12 @@ class AutoClicker:
              lambda p: self.make_key_chooser(p, self.location_key, "Set location"), None),
             ("Record key",
              lambda p: self.make_key_chooser(p, self.record_key, "Record"), None),
-        ], columns=3)
+            ("Draw shapes key",
+             lambda p: self.make_key_chooser(p, self.draw_key, "Draw shapes"), None),
+        ], columns=4)
         self.flow_label(ttk.Label(
             sub, text="Click a box, then press a key or mouse button. Esc cancels.\n"
-                      "In the app, Ctrl+1 to Ctrl+4 switch pages and Ctrl+Tab goes to the "
+                      "In the app, Ctrl+1 to Ctrl+6 switch pages and Ctrl+Tab goes to the "
                       "next one.",
             style="Muted.TLabel", wraplength=500, justify="left")).grid(
             row=1, column=0, columnspan=2, sticky="w", pady=(0, 2))
@@ -4491,7 +6262,7 @@ class AutoClicker:
         self.card_row(card, "Auto stop", self.auto_stop,
                       subtitle="Stop when you move or click the mouse yourself")
         self.card_row(card, "Start countdown", self.countdown,
-                      subtitle="Count down the start delay (3, 2, 1) on the badge and here")
+                      subtitle="Count down the start delay (3, 2, 1) on the badge and in this window")
         self.card_row(card, "Sound when finished", self.finish_sound,
                       subtitle="When a limit is reached or a replay ends")
 
@@ -4506,6 +6277,26 @@ class AutoClicker:
             value=lambda p: self.button_group(p, [
                 ("Open", lambda: self.open_folder(PROFILES_DIR)),
                 ("Move", lambda: self.move_folder("profiles"))]))
+        _, self.areas_where_card, _ = self.card_row(
+            card, "Areas folder", subtitle="",
+            value=lambda p: self.button_group(p, [
+                ("Open", lambda: self.open_folder(AREAS_DIR)),
+                ("Move", lambda: self.move_folder("areas"))]))
+        _, self.macros_where_card, _ = self.card_row(
+            card, "Macros folder", subtitle="",
+            value=lambda p: self.button_group(p, [
+                ("Open", lambda: self.open_folder(MACROS_DIR)),
+                ("Move", lambda: self.move_folder("macros"))]))
+
+        card = self.card_section(sub, 10, "About")
+        _, self.version_text, _ = self.card_row(
+            card, f"Auto Clicker v{APP_VERSION}", subtitle="",
+            value=lambda p: self.button_group(p, [("GitHub page", self.open_github, 100)]))
+        self.card_row(card, "Check for updates", self.check_updates,
+                      subtitle="Looks on GitHub for a newer version when the app opens",
+                      value=lambda p: self.button_group(p, [
+                          ("Check now", lambda: self.look_for_update(quiet=False), 84)]))
+        self.refresh_version_text()
 
         self.make_button(frame, "Reset to defaults", self.reset_defaults, height=36).grid(
             row=2, column=0, sticky="ew", pady=(14, 0))
@@ -4654,6 +6445,8 @@ class AutoClicker:
                 widget.redraw()
         self.root.update_idletasks()
         self.size_nav_buttons()
+        if not self.menu_is_vertical() and not self.mini_shown:
+            self.set_bar_height(self.bar_height)  # (a wider bar: the window keeps room for it)
         self.refresh_running()
 
     def play_finish_sound(self):
@@ -4673,7 +6466,7 @@ class AutoClicker:
         self.root.bell()
 
     def bind_page_shortcuts(self):
-        """Ctrl+1 to Ctrl+4 go to a page; Ctrl+Tab / Ctrl+Shift+Tab go to the next / previous."""
+        """Ctrl+1 to Ctrl+6 go to a page; Ctrl+Tab / Ctrl+Shift+Tab go to the next / previous."""
         pages = list(self.nav_buttons)
         # bound on the window itself, so they're handled before Tk's own Tab handling
         for number, name in enumerate(pages, start=1):
@@ -4759,6 +6552,10 @@ class AutoClicker:
             return  # mini mode only has the mouse clicker
         if name == "recording":
             self.refresh_profile_list()  # picks up .txt files added or renamed by hand
+        elif name == "areas":
+            self.refresh_saved_list("area")
+        elif name == "macros":
+            self.refresh_saved_list("macro")
         self.page.set(name)
         self.show_page()
         if name in PAGE_MODES and PAGE_MODES[name] != self.active_mode:
@@ -4785,6 +6582,8 @@ class AutoClicker:
         text = f"{'Stop' if self.armed else 'Start'} ({key})"
         running_mode = self.settings.get("mode") if self.armed else None
         for btn, mode in ((self.toggle_btn, "mouse"), (self.mini_toggle_btn, "mouse"),
+                          (self.area_toggle_btn, "mouse"),
+                          (self.macro_toggle_btn, "macro"),
                           (self.kb_toggle_btn, "keyboard"),
                           (self.replay_btn, "replay")):
             btn.set_text(text)
@@ -4802,7 +6601,7 @@ class AutoClicker:
             extra = " · keys only" if self.record_keys else ""
             return True, "Recording", f"{input_name(self.record_key.get())} to stop{extra}"
         if not self.armed:
-            what = {"mouse": "mouse clicker", "keyboard": "keyboard clicker",
+            what = {"mouse": "mouse clicker", "macro": "macro", "keyboard": "keyboard clicker",
                     "replay": "recording"}[self.active_mode]
             return False, "Ready", f"{input_name(self.hotkey.get())} starts the {what}"
         s = self.settings
@@ -4833,6 +6632,12 @@ class AutoClicker:
             parts = [f"{n} {'action' if n == 1 else 'actions'}", plays]
             if s["speed"] != 1:
                 parts.append(f"{s['speed']:g}x speed")
+        elif s["mode"] == "macro":
+            title = "Playing macro"
+            n = len(s["macro"])
+            plays = {0: "on a loop", 1: "once"}.get(s["plays"], f"{s['plays']} times")
+            parts = [f"{n} {'click' if n == 1 else 'clicks'}", plays,
+                     f"every {s['interval']:g}s"]
         elif s["mode"] == "keyboard":
             key = input_name(self.kb_key.get())
             title = f"Holding {key}" if s["hold"] else f"Pressing {key}"
@@ -4849,7 +6654,9 @@ class AutoClicker:
                 parts = [rate, button]
                 if s["count"] > 1:
                     parts.append(f"{self.click_type.get().lower()} clicks")
-            if spots > 1:
+            if s.get("area"):
+                parts.append(f"area of {s['area'].count:,} spots")
+            elif spots > 1:
                 parts.append(f"{spots} spots")
             elif spots == 1:
                 parts.append("set spot")
@@ -4868,11 +6675,21 @@ class AutoClicker:
         if not self.armed:
             return ""
         s, parts = self.settings, []
-        if s.get("limit"):
+        if s.get("mode") == "macro":
+            n, plays = len(s["macro"]), s["plays"]
+            if self.clicks:
+                parts.append(f"click {(self.clicks - 1) % n + 1} of {n}")
+                if plays != 1:
+                    play = (self.clicks - 1) // n + 1
+                    parts.append(f"play {play} of {plays}" if plays else f"play {play}")
+        elif s.get("limit"):
             parts.append(f"{self.clicks} of {s['limit']} {s['unit'][1]}")
         if s.get("time_limit"):
             elapsed = time.monotonic() - self.started_at if self.running.is_set() else 0
             parts.append(f"{clock(max(0.0, s['time_limit'] - elapsed))} left")
+        if s.get("area") and self.clicks:
+            count = s["area"].count
+            parts.append(f"spot {(self.clicks - 1) % count + 1:,} of {count:,}")
         if s.get("mode") == "replay" and s.get("plays", 0) > 1:
             parts.append(f"play {min(self.plays_done + 1, s['plays'])} of {s['plays']}")
         return " · ".join(parts)
@@ -4939,6 +6756,9 @@ class AutoClicker:
         card_palette = self.surface_palette("card")
         for widget in self.round_widgets:
             widget.set_palette(card_palette if widget.surface == "card" else p)
+        for window in self.root.winfo_children():
+            if isinstance(window, ScreenLayer):  # the Areas or Macros menu, if it's open
+                window.set_accent(p["accent"])
         if getattr(self, "badge", None) is not None:
             self.refresh_running()
 
@@ -5015,7 +6835,7 @@ class AutoClicker:
             code = make_combo(self.capture_mods, code)
         self.capture_mods = []
         if not chooser.allowed(code):
-            in_use = code in (self.hotkey.get(), self.location_key.get(), self.record_key.get())
+            in_use = code in self.app_keys()
             chooser.flash("Already in use" if in_use else "Can't use that")
             return True
         if chooser.purpose != "Profile" and self.profile_hotkeys.get(code):
@@ -5062,10 +6882,13 @@ class AutoClicker:
             values = {name: var.get() for name, var in self.profile_vars.items()}
             values.update({
                 "locations": self.locations or None,
+                "area": list(self.area),
+                "macro": list(self.macro),
                 "recording": self.recording,
                 "hotkey": self.hotkey.get(),
                 "location_key": self.location_key.get(),
                 "record_key": self.record_key.get(),
+                "draw_key": self.draw_key.get(),
                 "auto_stop": bool(self.auto_stop.get()),
                 "always_on_top": bool(self.on_top.get()),
                 "mini_mode": bool(self.mini.get()),
@@ -5076,13 +6899,14 @@ class AutoClicker:
                 "badge_corner": self.badge_corner.get(),
                 "finish_sound": bool(self.finish_sound.get()),
                 "countdown": bool(self.countdown.get()),
+                "check_updates": bool(self.check_updates.get()),
                 "text_size": self.text_size.get(),
                 "sidebar_width": self.sidebar_width,
                 "bar_height": self.bar_height,
                 "dark_mode": bool(self.dark.get()),
                 "accent": self.accent.get(),
             })
-            for name in ("limit", "kb_limit"):
+            for name in ("limit", "kb_limit", "macro_limit"):
                 values[name] = max(1, int(values[name]))
             return values
         except (tk.TclError, ValueError):
@@ -5105,11 +6929,12 @@ class AutoClicker:
         variables = dict(self.profile_vars)
         variables.update({
             "hotkey": self.hotkey, "location_key": self.location_key,
-            "record_key": self.record_key,
+            "record_key": self.record_key, "draw_key": self.draw_key,
             "auto_stop": self.auto_stop, "always_on_top": self.on_top, "mini_mode": self.mini,
             "badge_show": self.badge_show, "badge_corner": self.badge_corner,
             "sidebar_side": self.sidebar_side,
             "finish_sound": self.finish_sound, "countdown": self.countdown,
+            "check_updates": self.check_updates,
             "text_size": self.text_size,
             "dark_mode": self.dark, "accent": self.accent,
         })
@@ -5144,9 +6969,13 @@ class AutoClicker:
         finally:
             self.hotkey_var_busy = False
 
+    def app_keys(self):
+        """The keys the app itself uses (start/stop, set location, record, draw shapes)."""
+        return (self.hotkey.get(), self.location_key.get(), self.record_key.get(),
+                self.draw_key.get())
+
     def profile_hotkey_allowed(self, code):
-        return is_valid_input(code) and code not in (
-            self.hotkey.get(), self.location_key.get(), self.record_key.get())
+        return is_valid_input(code) and code not in self.app_keys()
 
     def on_profile_hotkey_set(self):
         """The profile hotkey box was changed: save it in the profile's file."""
@@ -5318,6 +7147,51 @@ class AutoClicker:
             self.delete_armed_job = None
         self.delete_btn.set_text("Delete")
 
+    # ---------------- Updates ----------------
+    def refresh_version_text(self):
+        if self.newer_version:
+            text = f"{self.newer_version[0]} is out: open the GitHub page to get it"
+        else:
+            text = "Made with AI (Claude). Free and open source (MIT licence)."
+        self.version_text.configure(text=text)
+
+    def look_for_update(self, quiet=True):
+        """Ask GitHub for its newest release, on a background thread (the answer comes back
+        through the event queue, see poll). quiet: only say something if there's an update."""
+        if not quiet:
+            self.status.config(text="Checking for updates...")
+
+        def check():
+            try:
+                tag, page = latest_release()
+                self.events.put(("update", tag, page, quiet))
+            except Exception as err:
+                print(f"Couldn't check for updates: {err}")
+                self.events.put(("update", None, None, quiet))
+
+        threading.Thread(target=check, daemon=True).start()
+
+    def got_update_answer(self, tag, page, quiet):
+        if tag is None:
+            if not quiet:
+                self.status.config(text="Couldn't check for updates (no internet?)")
+            return
+        newest, ours = version_numbers(tag), version_numbers(APP_VERSION)
+        if newest and ours and newest > ours:
+            self.newer_version = (tag, page)
+            self.refresh_version_text()
+            self.status.config(text=f"{tag} is out: see Settings > About")
+        elif not quiet:
+            self.status.config(text=f"You have the newest version (v{APP_VERSION})")
+
+    def open_github(self):
+        page = self.newer_version[1] if self.newer_version else GITHUB_PAGE
+        try:
+            subprocess.Popen(["xdg-open", page], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            self.status.config(text="Couldn't open the web page")
+
     def open_folder(self, folder):
         try:
             folder.mkdir(parents=True, exist_ok=True)
@@ -5331,12 +7205,23 @@ class AutoClicker:
                                         f"file in {short_path(PROFILES_DIR)}.")
         self.settings_where.config(text=short_path(SETTINGS_PATH.parent))
         self.profiles_where_card.config(text=short_path(PROFILES_DIR))
+        self.areas_where_card.config(text=short_path(AREAS_DIR))
+        self.libraries["area"]["where"].config(
+            text=f"An area is a set of saved shapes. Each one is a .txt file in "
+                 f"{short_path(areas_dir())}.")
+        self.macros_where_card.config(text=short_path(MACROS_DIR))
+        self.libraries["macro"]["where"].config(
+            text=f"A macro is a set of saved clicks. Each one is a .txt file in "
+                 f"{short_path(macros_dir())}.")
 
     def move_folder(self, kind):
-        """Move the settings or profiles folder somewhere else (Settings > Storage)."""
-        global SETTINGS_PATH, PROFILES_DIR
-        current = SETTINGS_PATH.parent if kind == "settings" else PROFILES_DIR
-        marker = SETTINGS_MARKER if kind == "settings" else PROFILES_MARKER
+        """Move the settings, profiles, areas or macros folder somewhere else (Settings >
+        Storage)."""
+        global SETTINGS_PATH, PROFILES_DIR, AREAS_DIR, MACROS_DIR
+        current = {"settings": SETTINGS_PATH.parent, "profiles": PROFILES_DIR,
+                   "areas": AREAS_DIR, "macros": MACROS_DIR}[kind]
+        marker = {"settings": SETTINGS_MARKER, "profiles": PROFILES_MARKER,
+                  "areas": AREAS_MARKER, "macros": MACROS_MARKER}[kind]
         chosen = choose_folder(self.root, current.parent)
         if chosen is None:
             return
@@ -5349,8 +7234,10 @@ class AutoClicker:
         if (chosen / marker).exists() or empty or not chosen.exists():
             target = chosen
         else:
-            target = chosen / ("Auto Clicker settings" if kind == "settings"
-                               else "Auto Clicker profiles")
+            target = chosen / {"settings": "Auto Clicker settings",
+                               "profiles": "Auto Clicker profiles",
+                               "areas": "Auto Clicker areas",
+                               "macros": "Auto Clicker macros"}[kind]
         if target.resolve() == current.resolve():
             self.status.config(text="It's already there")
             return
@@ -5382,9 +7269,17 @@ class AutoClicker:
         if kind == "settings":
             SETTINGS_PATH = target / "settings.json"
             mark_folder(target, SETTINGS_MARKER, "settings")
-        else:
+        elif kind == "profiles":
             PROFILES_DIR = target
             mark_folder(target, PROFILES_MARKER, "profiles")
+        elif kind == "areas":
+            AREAS_DIR = target
+            mark_folder(target, AREAS_MARKER, "saved areas")
+            self.refresh_saved_list("area")
+        else:
+            MACROS_DIR = target
+            mark_folder(target, MACROS_MARKER, "saved macros")
+            self.refresh_saved_list("macro")
         remember_locations()
         self.refresh_profile_list()
         self.status.config(text=f"Moved to {short_path(target)}")
@@ -5451,8 +7346,7 @@ class AutoClicker:
         self.root.update_idletasks()
         self.record_rect = (self.root.winfo_rootx(), self.root.winfo_rooty(),
                             self.root.winfo_width(), self.root.winfo_height())
-        self.record_exclude = {self.hotkey.get(), self.location_key.get(),
-                               self.record_key.get(), "key:esc", *self.profile_hotkeys}
+        self.record_exclude = {*self.app_keys(), "key:esc", *self.profile_hotkeys}
         self.record_keys = bool(self.record_keys_only.get())
         self.record_movement = bool(self.record_moves.get()) and not self.record_keys
         self.record_from_button = from_button
@@ -5619,6 +7513,29 @@ class AutoClicker:
                     "label": label, "limit": 0, "time_limit": 0,
                     "delay": 0.0, "locations": None, "codes": set(),
                 }
+            elif mode == "macro":
+                if not self.macro:
+                    self.status.config(text="Record some clicks first")
+                    return False
+                clicks = [(BUTTONS[c["button"]], c["x"], c["y"]) for c in self.macro]
+                if not self.macro_loop.get():
+                    plays = 1
+                elif self.macro_limit_on.get():
+                    plays = max(1, int(self.macro_limit.get()))
+                else:
+                    plays = 0  # forever
+                self.settings = {
+                    "mode": "macro", "hold": False, "macro": clicks, "plays": plays,
+                    "codes": {input_code(button) for button, _x, _y in clicks},
+                    "count": 1,
+                    "interval": self.macro_wait_value(),
+                    "limit": plays * len(clicks),  # 0: never stop
+                    "time_limit": 0,
+                    "delay": min(max(0.0, float(self.macro_delay.get())), 60.0),
+                    "locations": None,
+                    "area_return": bool(self.macro_return.get()),
+                    "unit": ("click", "clicks"),
+                }
             elif mode == "keyboard":
                 hold = bool(self.kb_hold.get())
                 code = self.kb_key.get()
@@ -5628,7 +7545,7 @@ class AutoClicker:
                     "keys": keys_for_combo(code),   # modifiers first, e.g. [Ctrl, C]
                     "codes": codes_for_combo(code),
                     "count": 1,
-                    "interval": 1.0 / max(0.1, float(self.kb_cps.get())),
+                    "interval": 1.0 / min(max(0.1, float(self.kb_cps.get())), MAX_CPS),
                     # 0 means "never stop"; only used when the toggle is on and not holding
                     "limit": (max(1, int(self.kb_limit.get()))
                               if self.kb_limit_on.get() and not hold else 0),
@@ -5642,9 +7559,9 @@ class AutoClicker:
                 hold = bool(self.hold.get())
                 button = BUTTONS[self.button.get()]
                 if self.click_delay_on.get():
-                    interval = max(0.01, float(self.click_delay.get()))
+                    interval = max(1.0 / MAX_CPS, float(self.click_delay.get()))
                 else:
-                    interval = 1.0 / max(0.1, float(self.cps.get()))
+                    interval = 1.0 / min(max(0.1, float(self.cps.get())), MAX_CPS)
                 self.settings = {
                     "mode": "mouse",
                     "hold": hold,
@@ -5659,13 +7576,22 @@ class AutoClicker:
                     "delay": max(0.0, float(self.delay.get())),
                     # None means "click wherever the mouse is"
                     "locations": (self.click_spots()
-                                  if self.location_on.get() and self.locations else None),
+                                  if self.location_on.get() and self.locations
+                                  and not self.area_on.get() else None),
+                    # every spot in the area's shapes, see AreaPlan
+                    "area": self.area_plan_now() if self.area_on.get() and not hold else None,
+                    "area_box": shapes_box(self.area) if self.area else None,
+                    "area_return": bool(self.area_return.get()),
                     "unit": ("click", "clicks"),
                 }
             # replays move the mouse themselves, so auto stop would stop them straight away
             self.settings["auto_stop"] = bool(self.auto_stop.get()) and mode != "replay"
         except (tk.TclError, ValueError, KeyError):
             self.status.config(text="Invalid setting. Check the numbers.")
+            return False
+        if (mode == "mouse" and self.area_on.get() and not self.settings["hold"]
+                and not self.settings.get("area")):
+            self.status.config(text="Add a shape on the Areas page first")
             return False
         if mode == "mouse" and self.location_on.get() and not self.locations:
             self.status.config(
@@ -5692,6 +7618,415 @@ class AutoClicker:
             self.status.config(text=message)
         self.refresh_location()
         self.save_settings()
+
+    # ---------------- Areas ----------------
+    def area_gap_value(self):
+        try:
+            return min(max(int(self.area_gap.get()), AREA_GAP_MIN), AREA_GAP_MAX)
+        except (tk.TclError, ValueError):
+            return DEFAULTS["area_gap"]
+
+    def area_plan_now(self):
+        """The AreaPlan for the current shapes and gap (worked out again only if they change)."""
+        key = (json.dumps(self.area), self.area_gap_value(), bool(self.area_in_order.get()))
+        if self.area_plan is None or self.area_plan[0] != key:
+            self.area_plan = (key, AreaPlan(self.area, key[1], key[2]) if self.area else None)
+        return self.area_plan[1]
+
+    def refresh_area(self):
+        plan = self.area_plan_now()
+        if not self.area:
+            mouse = "No shapes yet: press Edit to draw some."
+            info = "No shapes yet: add one above."
+        else:
+            n = len(self.area)
+            info = (f"{n} {'shape' if n == 1 else 'shapes'}, {plan.count:,} "
+                    f"{'spot' if plan.count == 1 else 'spots'}, "
+                    f"{self.area_gap_value()} px apart")
+            if n > 1 and self.area_in_order.get():
+                info += ", one shape after another"
+            mouse = info + ". Press Edit to change them."
+            info += ". The mouse clicker clicks them while this is on."
+        self.area_hint.config(text=mouse)
+        self.area_info.config(text=info)
+        self.refresh_shape_list()
+
+    def refresh_shape_list(self):
+        """One row per shape on the Areas page, each with a Remove button."""
+        self.shape_rows = self.fill_list(
+            self.shapes_card, self.shape_rows, "No shapes yet",
+            [(str(i + 1) if self.area_in_order.get() else None, describe_shape(shape),
+              lambda n=i: self.remove_shape(n)) for i, shape in enumerate(self.area)])
+
+    def fill_list(self, card, old_rows, empty, items):
+        """Fill a card with one row per item (the shapes on the Areas page, the clicks on
+        the Macros page): (badge, words, remove), where badge is a ClickBadge's label or
+        None. Takes the old rows away first. Returns the new rows."""
+        body = card.body
+        for widget in old_rows:  # take the old rows away (and stop theming them)
+            for part in [widget] + widget.winfo_children():
+                for group in (self.round_widgets, self.card_frames, self.dividers):
+                    if part in group:
+                        group.remove(part)
+            widget.destroy()
+        rows = []
+        p = self.palette
+        if not items:
+            label = ttk.Label(body, text=empty, style="CardMuted.TLabel")
+            label.grid(row=0, column=0, sticky="w", padx=10, pady=10)
+            self.repaint_soon()
+            return [label]
+        for i, (badge, words, remove) in enumerate(items):
+            if i:
+                line = tk.Frame(body, height=1, bd=0, highlightthickness=0, bg=p["divider"])
+                line.grid(row=2 * i - 1, column=0, sticky="ew", padx=10)
+                self.dividers.append(line)
+                rows.append(line)
+            row = tk.Frame(body, bd=0, highlightthickness=0, bg=p["card"])
+            row.grid(row=2 * i, column=0, sticky="ew", padx=10)
+            self.card_frames.append(row)
+            column = 0
+            if badge:
+                self.register(ClickBadge(row, badge, self.font_caption, self.font_badge_small),
+                              surface="card").grid(row=0, column=0, padx=(0, 10), pady=5)
+                column = 1
+            row.columnconfigure(column, weight=1)
+            ttk.Label(row, text=words, style="Card.TLabel").grid(
+                row=0, column=column, sticky="w", pady=8)
+            self.default_surface = "card"
+            try:
+                self.make_button(row, "Remove", remove, height=28, width=70).grid(
+                    row=0, column=column + 1, padx=(10, 0))
+            finally:
+                self.default_surface = "page"
+            rows.append(row)
+        self.repaint_soon()  # everything below the list moved: redraw it, no leftover bits
+        return rows
+
+    def refresh_draw_button(self):
+        self.draw_btn.set_text(f"Draw shapes ({input_name(self.draw_key.get())})")
+
+    def draw_new_shape(self):
+        if any(isinstance(w, ScreenLayer) for w in self.root.winfo_children()):
+            return  # already drawing (or the Macros menu is open)
+        # (starts on the shape drawn last; the menu at the top switches it)
+        kind = self.area[-1]["type"] if self.area else "rectangle"
+        ShapeDrawer(self.root, kind, self.area, on_done=self.add_shapes,
+                    accent=self.palette["accent"], in_order=bool(self.area_in_order.get()))
+
+    def add_shapes(self, shapes, cleared=False, in_order=None):
+        """The shapes drawn on the screen (any number, from its menu). cleared: its Clear
+        button took the area's old shapes away, so the area is just these now. in_order:
+        its In order switch."""
+        if in_order is not None and in_order != self.area_in_order.get():
+            self.area_in_order.set(in_order)  # (saves and refreshes, see below)
+            if not shapes and not cleared:
+                self.save_settings()
+                self.status.config(text="In order " + ("on" if in_order else "off"))
+                return
+        if not shapes and not cleared:
+            return
+        if cleared:
+            self.area = list(shapes)
+        else:
+            self.area.extend(shapes)
+        if self.area:
+            self.area_on.set(True)
+        self.refresh_area()
+        self.save_settings()
+        n = len(shapes)
+        added = (f"a {SHAPE_NAMES[shapes[0]['type']].lower()}" if n == 1
+                 else f"{n} shapes" if n else "")
+        self.status.config(text=(f"Cleared, then added {added}" if cleared and n
+                                 else "Shapes cleared" if cleared else f"Added {added}"))
+
+    def remove_shape(self, index):
+        if 0 <= index < len(self.area):
+            removed = self.area.pop(index)
+            self.refresh_area()
+            self.save_settings()
+            self.status.config(text=f"Removed the {SHAPE_NAMES[removed['type']].lower()}")
+
+    def clear_shapes(self):
+        if not self.area:
+            return
+        if self.clear_shapes_job is None:
+            # first press: ask to press again, so the shapes aren't lost by accident
+            self.clear_shapes_btn.set_text("Sure?")
+            self.clear_shapes_job = self.root.after(3000, self.disarm_clear_shapes)
+            return
+        self.disarm_clear_shapes()
+        self.area = []
+        self.refresh_area()
+        self.save_settings()
+        self.status.config(text="Shapes cleared")
+
+    def disarm_clear_shapes(self):
+        if self.clear_shapes_job is not None:
+            self.root.after_cancel(self.clear_shapes_job)
+            self.clear_shapes_job = None
+        self.clear_shapes_btn.set_text("Clear all")
+
+    def show_spots(self):
+        plan = self.area_plan_now()
+        if plan is None or not plan.count:
+            self.status.config(text="Add a shape first")
+            return
+        ShapeDrawer(self.root, None, self.area, plan=plan, gap=self.area_gap_value(),
+                    accent=self.palette["accent"], in_order=bool(self.area_in_order.get()))
+
+    def refresh_area_list(self, select=None):
+        self.refresh_saved_list("area", select)
+
+    def apply_area(self, shapes, gap, in_order=False):
+        """Use a saved area's shapes (Load)."""
+        self.area = [dict(shape) for shape in shapes]
+        self.area_gap.set(gap)
+        self.area_in_order.set(in_order)
+        self.area_on.set(True)
+        self.refresh_area()
+        self.save_settings()
+
+    # ---------------- Macros ----------------
+    def macro_wait_value(self):
+        try:
+            return min(max(float(self.macro_wait.get()), MACRO_WAIT_MIN), MACRO_WAIT_MAX)
+        except (tk.TclError, ValueError):
+            return DEFAULTS["macro_wait"]
+
+    def refresh_macro(self):
+        if not hasattr(self, "macro_info"):
+            return  # (still building the window)
+        n = len(self.macro)
+        if not n:
+            info = "No clicks yet: press Record clicks to add some."
+        else:
+            wait = self.macro_wait_value()
+            info = f"{n} {'click' if n == 1 else 'clicks'}, one every {wait:g}s"
+            if not self.macro_loop.get():
+                info += ", played once"
+            elif self.macro_limit_on.get():
+                try:
+                    plays = max(1, int(self.macro_limit.get()))
+                    info += f", played {plays} {'time' if plays == 1 else 'times'}"
+                except (tk.TclError, ValueError):
+                    pass
+            else:
+                info += ", on a loop"
+        self.macro_info.config(text=info)
+        self.refresh_click_list()
+
+    def refresh_click_list(self):
+        """One row per click on the Macros page, in order: its circle (L1, R2...), where it
+        is, and a Remove button."""
+        self.click_rows = self.fill_list(
+            self.clicks_card, self.click_rows, "No clicks yet",
+            [(macro_label(i, click), f"{click['button']} click at {click['x']}, {click['y']}",
+              lambda n=i: self.remove_click(n)) for i, click in enumerate(self.macro)])
+
+    def record_macro(self):
+        if any(isinstance(w, ScreenLayer) for w in self.root.winfo_children()):
+            return  # the Areas or Macros menu is already open
+        if self.armed:
+            self.stop()  # (its clicks would land on the menu)
+        MacroRecorder(self.root, self.macro, on_done=self.macro_recorded,
+                      accent=self.palette["accent"])
+
+    def macro_recorded(self, clicks):
+        """The clicks from the Macros menu (Done)."""
+        if clicks == self.macro:
+            return
+        self.macro = clicks
+        self.refresh_macro()
+        self.save_settings()
+        n = len(clicks)
+        self.status.config(text=f"Macro has {n} {'click' if n == 1 else 'clicks'}" if n
+                           else "Clicks cleared")
+
+    def remove_click(self, index):
+        if 0 <= index < len(self.macro):
+            removed = self.macro.pop(index)
+            self.refresh_macro()
+            self.save_settings()
+            self.status.config(text=f"Removed {macro_label(index, removed)}")
+
+    def clear_macro(self):
+        if not self.macro:
+            return
+        if self.clear_macro_job is None:
+            # first press: ask to press again, so the clicks aren't lost by accident
+            self.clear_macro_btn.set_text("Sure?")
+            self.clear_macro_job = self.root.after(3000, self.disarm_clear_macro)
+            return
+        self.disarm_clear_macro()
+        self.macro = []
+        self.refresh_macro()
+        self.save_settings()
+        self.status.config(text="Clicks cleared")
+
+    def disarm_clear_macro(self):
+        if self.clear_macro_job is not None:
+            self.root.after_cancel(self.clear_macro_job)
+            self.clear_macro_job = None
+        self.clear_macro_btn.set_text("Clear all")
+
+    def show_macro(self):
+        if not self.macro:
+            self.status.config(text="Record some clicks first")
+            return
+        if any(isinstance(w, ScreenLayer) for w in self.root.winfo_children()):
+            return
+        if self.armed:
+            self.stop()  # (its clicks would close it straight away)
+        MacroRecorder(self.root, self.macro, accent=self.palette["accent"], show_only=True)
+
+    def apply_macro(self, clicks, wait):
+        """Use a saved macro's clicks (Load)."""
+        self.macro = [dict(click) for click in clicks]
+        self.macro_wait.set(wait)
+        self.refresh_macro()
+        self.save_settings()
+
+    # ---------------- Saved areas and macros ----------------
+    # Kept like profiles: one .txt file each, in their own folder. self.libraries says how
+    # to read and write each kind (see build_saved_section).
+    def refresh_saved_list(self, kind, select=None):
+        lib = self.libraries[kind]
+        names = lib["list"]()
+        lib["combo"].set_values(names)
+        if select is not None:
+            lib["choice"].set(select)
+        elif lib["choice"].get() not in names:
+            lib["choice"].set(names[0] if names else "")
+
+    def chosen_saved(self, kind):
+        """The saved area / macro picked in the list, or None (with a message) if there
+        isn't one."""
+        lib = self.libraries[kind]
+        name = lib["choice"].get()
+        if not name or not lib["path"](name).exists():
+            self.status.config(text=f"Pick a saved {kind} first")
+            self.refresh_saved_list(kind)
+            return None
+        return name
+
+    def load_saved(self, kind):
+        lib = self.libraries[kind]
+        name = self.chosen_saved(kind)
+        if name is None:
+            return
+        found = lib["read"](name)
+        if not found:
+            self.status.config(text=f"Couldn't read {name}")
+            return
+        lib["apply"](*found)
+        self.status.config(text=f"Loaded {name}")
+
+    def save_saved(self, kind):
+        lib = self.libraries[kind]
+        current = lib["current"]()
+        if current is None:
+            self.status.config(text=lib["empty"])
+            return
+        name = safe_profile_name(lib["name"].get())
+        if not name:
+            self.status.config(text=f"Type {lib['a']} name first")
+            return
+        updating = lib["path"](name).exists()
+        if not lib["write"](name, *current):
+            self.status.config(text=f"Couldn't save the {kind}")
+            return
+        self.refresh_saved_list(kind, select=name)
+        lib["name"].set("")
+        self.root.focus_set()
+        self.status.config(text=f"Updated {name}" if updating else f"Saved {name}")
+
+    def check_new_saved_name(self, kind, typed, old=None):
+        """(name, problem): the name to use, or why it can't be used."""
+        lib = self.libraries[kind]
+        name = safe_profile_name(typed or "")
+        if not name:
+            return None, "Type a name first."
+        taken = [n for n in lib["list"]() if n.lower() == name.lower() and n != old]
+        if taken:
+            return None, f"There's already {lib['a']} called {taken[0]}."
+        return name, None
+
+    def rename_saved(self, kind):
+        lib = self.libraries[kind]
+        old = self.chosen_saved(kind)
+        if old is None:
+            return
+
+        def ok(typed):
+            new, problem = self.check_new_saved_name(kind, typed, old)
+            if problem:
+                return problem
+            if new == old:
+                return None
+            found = lib["read"](old)
+            if not found or not lib["write"](new, *found):
+                return f"Couldn't rename {old}."
+            if new.lower() != old.lower():  # (same file if only the capitals changed)
+                try:
+                    lib["path"](old).unlink()
+                except OSError:
+                    pass
+            self.refresh_saved_list(kind, select=new)
+            self.status.config(text=f"Renamed {old} to {new}")
+            return None
+
+        SmallDialog(self.root, f"Rename {kind}", f"New name for {old}:", self.palette,
+                    ok_text="Rename", name=old, ok=ok)
+
+    def duplicate_saved(self, kind):
+        lib = self.libraries[kind]
+        old = self.chosen_saved(kind)
+        if old is None:
+            return
+        suggestion, n = f"{old} copy", 2
+        while lib["path"](suggestion).exists():
+            suggestion, n = f"{old} copy {n}", n + 1
+
+        def ok(typed):
+            new, problem = self.check_new_saved_name(kind, typed)
+            if problem:
+                return problem
+            found = lib["read"](old)
+            if not found or not lib["write"](new, *found):
+                return f"Couldn't copy {old}."
+            self.refresh_saved_list(kind, select=new)
+            self.status.config(text=f"Copied {old} to {new}")
+            return None
+
+        SmallDialog(self.root, f"Duplicate {kind}", f"Name for the copy of {old}:",
+                    self.palette, ok_text="Duplicate", name=suggestion, ok=ok)
+
+    def delete_saved(self, kind):
+        lib = self.libraries[kind]
+        name = self.chosen_saved(kind)
+        if name is None:
+            return
+        if lib["delete_job"] is None:
+            # first press: ask to press again, so nothing is deleted by accident
+            lib["delete_btn"].set_text("Sure?")
+            lib["delete_job"] = self.root.after(3000, lambda: self.disarm_delete_saved(kind))
+            return
+        self.disarm_delete_saved(kind)
+        try:
+            lib["path"](name).unlink()
+        except OSError:
+            self.status.config(text=f"Couldn't delete {name}")
+            return
+        self.refresh_saved_list(kind)
+        self.status.config(text=f"Deleted {name}")
+
+    def disarm_delete_saved(self, kind):
+        lib = self.libraries[kind]
+        if lib["delete_job"] is not None:
+            self.root.after_cancel(lib["delete_job"])
+            lib["delete_job"] = None
+        lib["delete_btn"].set_text("Delete")
 
     def click_spots(self):
         spots = self.locations if self.multi_location.get() and not self.hold.get() \
@@ -5749,6 +8084,8 @@ class AutoClicker:
         else:
             self.status.config(text="Clicking...")
         self.anchor = self.mouse.position
+        self.home_pos = None  # where "Put the mouse back" returns it to, see tap
+        self.note_own_windows()
         self.started_at = time.monotonic()
         self.running.set()
         self.refresh_running()
@@ -5776,10 +8113,59 @@ class AutoClicker:
                 self.keyboard.press(key)
             for key in reversed(s["keys"]):
                 self.keyboard.release(key)
+        elif s["mode"] == "macro":  # the macro's clicks, one after another
+            button, x, y = s["macro"][self.clicks % len(s["macro"])]
+            if not self.on_own_window((x, y)):  # (never click the auto clicker itself)
+                self.click_spot(s, (x, y), button)
+        elif s.get("area"):  # every spot in the area, one after another
+            spot = s["area"].point(self.clicks)
+            if not self.on_own_window(spot):  # (it would press its own buttons)
+                self.click_spot(s, spot, s["button"])
         else:
             if s["locations"]:  # one spot, or several clicked in turn
                 self.pointer.place(*s["locations"][self.clicks % len(s["locations"])])
             self.mouse.click(s["button"], s["count"])
+
+    def click_spot(self, s, spot, button):
+        """Click on a spot (areas and macros). With "Put the mouse back" on, it jumps there,
+        clicks, and jumps straight back to where your mouse was."""
+        if not s.get("area_return"):
+            self.pointer.place(*spot)
+            self.mouse.click(button, s["count"])
+            return
+        home = self.pointer.position()
+        if (s.get("auto_stop") and self.home_pos is not None
+                and math.hypot(home[0] - self.home_pos[0], home[1] - self.home_pos[1])
+                > self.MOVE_TOLERANCE):
+            self.events.put("moved")  # you moved it since the last click
+        self.home_pos = home
+        if not self.pointer.click_at(*spot, button.value, s["count"], home):
+            self.pointer.place(*spot)
+            self.mouse.click(button, s["count"])
+            self.pointer.place(*home)
+
+    def on_own_window(self, spot):
+        """True if a spot is on one of the app's own windows (see note_own_windows)."""
+        x, y = spot
+        return any(left <= x < right and top <= y < bottom
+                   for left, top, right, bottom in self.own_windows)
+
+    def note_own_windows(self):
+        """Where the app's windows are on screen (main window, badge, pop-ups), so area
+        clicking can leave them alone. Kept up to date by poll, read by the click thread."""
+        rects = []
+        for window in [self.root] + [w for w in self.root.winfo_children()
+                                     if isinstance(w, tk.Toplevel)]:
+            try:
+                if (window.winfo_viewable() and not isinstance(window, ScreenLayer)
+                        and window.winfo_width() > 1):
+                    x, y = window.winfo_rootx(), window.winfo_rooty()
+                    rects.append((x - 4, y - 40 if window is self.root else y - 4,
+                                  x + window.winfo_width() + 4,
+                                  y + window.winfo_height() + 4))  # (with its title bar)
+            except tk.TclError:
+                pass
+        self.own_windows = rects
 
     def press_and_hold(self, s):
         with self.hold_lock:
@@ -5882,10 +8268,14 @@ class AutoClicker:
         self.replay_pos = (x, y)
 
     def click_loop(self):
+        due = None      # when the next click is due (see below)
+        run = None      # the run it belongs to (a new start begins a new timetable)
         while not self.shutdown.is_set():
             if not self.running.wait(timeout=0.1):
                 continue
             s = self.settings
+            if s is not run:
+                run, due = s, None
 
             if s["mode"] == "replay":
                 try:
@@ -5901,6 +8291,12 @@ class AutoClicker:
                 self.release_held()
                 continue
 
+            # Clicks keep to a timetable: each one is due `interval` after the one before,
+            # however long the clicking itself took, so the speed is what you set (waiting
+            # the whole interval after each click would always run a little slow)
+            now = time.perf_counter()
+            if due is None or now - due > 0.25:
+                due = now  # starting, or the computer was busy for a while: don't rush
             self.tap(s)
             self.clicks += 1
 
@@ -5910,7 +8306,10 @@ class AutoClicker:
                 self.events.put("limit")
                 continue
 
-            self.stopped.wait(s["interval"])  # returns early if stopped
+            due += s["interval"]
+            wait = due - time.perf_counter()
+            if wait > 0:
+                self.stopped.wait(wait)  # returns early if stopped
 
     # ---------------- Keys, mouse buttons + polling ----------------
     # These run on pynput's threads, so they only pass the input on to poll()
@@ -5983,9 +8382,20 @@ class AutoClicker:
         # Auto stop: notice when you move the mouse away while it's clicking
         if not self.running.is_set() or not self.settings.get("auto_stop"):
             return
+        if ((self.settings.get("area") or self.settings.get("mode") == "macro")
+                and self.settings.get("area_return")):
+            return  # (the mouse is put back after each click: click_spot notices you moving it)
+        # Clicking an area moves the mouse all over it: only leaving the area counts
+        if self.settings.get("area"):
+            (left, top, right, bottom), t = self.settings["area_box"], self.MOVE_TOLERANCE
+            if not (left - t <= x <= right + t and top - t <= y <= bottom + t):
+                self.events.put("moved")
+            return
         # With set spots the app moves the mouse there itself, so measure from those;
         # otherwise measure from where the mouse was when clicking began.
-        spots = self.settings.get("locations") or ([self.anchor] if self.anchor else [])
+        spots = (self.settings.get("locations")
+                 or [(x_, y_) for _b, x_, y_ in self.settings.get("macro") or []]
+                 or ([self.anchor] if self.anchor else []))
         if spots and all(math.hypot(x - sx, y - sy) > self.MOVE_TOLERANCE for sx, sy in spots):
             self.events.put("moved")
 
@@ -6014,8 +8424,7 @@ class AutoClicker:
         # Auto stop: a mouse click of your own (not one of the app's keys) stops clicking
         if (self.running.is_set() and self.settings.get("auto_stop")
                 and code.startswith("mouse:")
-                and code not in (self.hotkey.get(), self.location_key.get(),
-                                 self.record_key.get())):
+                and code not in self.app_keys()):
             self.stop("Stopped (you clicked)")
             return
         if code == self.record_key.get():
@@ -6030,12 +8439,18 @@ class AutoClicker:
         elif (code == self.location_key.get() and self.location_on.get()
               and not self.recording_active):
             self.set_location()
+        elif code == self.draw_key.get() and not self.recording_active:
+            self.draw_new_shape()
 
     def poll(self):
         try:
             while True:
                 event = self.events.get_nowait()
-                if event == "limit":
+                if event == "limit" and self.settings.get("mode") == "macro":
+                    plays = self.settings["plays"]
+                    self.stop("Macro finished" if plays == 1 else f"Done: played {plays} times")
+                    self.play_finish_sound()
+                elif event == "limit":
                     count = self.settings["limit"]
                     one, many = self.settings["unit"]
                     self.stop(f"Done: {count} {one if count == 1 else many}")
@@ -6049,6 +8464,8 @@ class AutoClicker:
                     self.play_finish_sound()
                 elif event[0] == "system_theme":
                     self.update_icon()
+                elif event[0] == "update":
+                    self.got_update_answer(*event[1:])
                 elif event[0] == "release":
                     self.capture_release(event[1])
                 else:
@@ -6070,12 +8487,16 @@ class AutoClicker:
         if self.running.is_set() and limit and time.monotonic() - self.started_at >= limit:
             self.stop(f"Done: {limit:g} {'second' if limit == 1 else 'seconds'}")
             self.play_finish_sound()
+        if self.running.is_set() and (self.settings.get("area")
+                                      or self.settings.get("mode") == "macro"):
+            self.note_own_windows()
         self.poll_job = self.root.after(50, self.poll)
 
     def on_close(self):
         if self.shutdown.is_set():
             return  # already closing (e.g. asked to quit twice)
-        self.recording_active = False
+        if self.recording_active:
+            self.stop_recording()  # keep what was recorded so far
         self.root.after_cancel(self.poll_job)
         self.running.clear()
         self.stopped.set()
