@@ -29,10 +29,12 @@ and can record and replay what you do.
   - save recordings as profiles, each with its own hotkey; rename, duplicate or share them
     (they're plain text files)
 - **Stops by itself** after a number of clicks or a set time, or when you move the mouse
-- **Mini mode:** a small rounded panel that stays on top of other windows
+- **Mini mode:** a small rounded panel that stays on top of other windows (switch it on
+  from the menu bar)
 - **Badge:** a small card in the corner of the screen showing what's running, and
   counting down the start delay (3, 2, 1)
-- Light and dark mode, accent colours, text sizes, and a menu you can move to any side
+- Light and dark mode, accent colours, text sizes, and a menu you can move to any side and
+  drag bigger or smaller (the logo grows with it)
 - A penguin icon holding your own mouse pointer (it's read from your cursor theme when you
   install)
 - Tells you when a new version is out on GitHub

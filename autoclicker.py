@@ -94,7 +94,7 @@ PROFILES_MARKER = ".autoclicker-profiles"
 AREAS_MARKER = ".autoclicker-areas"
 MACROS_MARKER = ".autoclicker-macros"
 
-APP_VERSION = "3.3"  # bump this for each GitHub release, and tag the release "v" + this
+APP_VERSION = "3.4"  # bump this for each GitHub release, and tag the release "v" + this
 GITHUB_REPO = "GlamrockChica/Linux-auto-clicker"
 GITHUB_PAGE = f"https://github.com/{GITHUB_REPO}"
 APP_CLASS = "autoclicker"  # window class; install.sh sets StartupWMClass to match
@@ -2268,62 +2268,167 @@ def over(top, rgb, covered):
 
 
 class Logo(tk.Canvas):
-    """The app's logo for the top of the sidebar: the penguin with its cursor, in the
-    accent colour, and the app's name next to it."""
+    """The app's logo for the top of the menu: the penguin with its cursor, in the accent
+    colour, and the app's name next to it. It grows and shrinks with the menu (set_size).
+    Resizing it while the menu is being dragged would make the drag judder (a bigger logo
+    can even make the window wider), and working out the penguin's shape at a new size is
+    slow, so it changes size once the menu stops changing for a moment: the new shape is
+    worked out in the background, then the logo takes its new size and picture together.
+    Sizes it has drawn are kept, so going back to one is quicker."""
 
     NAME = "Pengclick"
-    ICON = 42  # icon size in pixels
+    ICON = 42  # icon size in pixels at the menu's normal size
     GAP = 8    # space between icon and name
+    WAIT_MS = 90  # how long the size must stay put before the logo follows it
 
-    def __init__(self, parent, font):
-        f = tkfont.Font(font=font)
-        height = max(self.ICON, f.metrics("linespace") * 2)
-        width = self.ICON + self.GAP + f.measure(self.NAME) + 4
-        super().__init__(parent, width=width, height=height, highlightthickness=0, bd=0)
+    def __init__(self, parent, font, on_resize=None):
+        super().__init__(parent, highlightthickness=0, bd=0)
         self.font = font
+        self.on_resize = on_resize  # called once it has taken a new size
         self.palette = None
-        # the shapes don't change, only the colours do
+        self.shapes = {}      # icon size -> (masks, pointer layer), see shapes_for
+        self.icon = 0         # the size it is
+        self.points = None    # how big its name is
+        self.wanted = None    # (icon, points) it's going to be
+        self.shown = None     # (size, masks, pointer) of the picture drawn now
+        self.job = None       # waiting for the size to stay put
+        self.working = None   # [size, result or None] while a thread works out shapes
+        self.image = tk.PhotoImage(width=1, height=1)
+        self.bind("<Configure>", lambda e: self.place())  # (just moves things: quick)
+        self.set_size(self.ICON)
+
+    @staticmethod
+    def shapes_for(size):
+        """(masks, pointer layer) for a penguin `size` pixels across (slow)."""
         image = pointer_image()
-        self.masks = logo_masks(self.ICON, arrow=image is None)
-        self.pointer = pointer_layer(self.ICON, image) if image else {}
-        self.image = tk.PhotoImage(width=self.ICON, height=self.ICON)
-        self.bind("<Configure>", lambda e: self.redraw())
+        samples = 4 if size <= 48 else 3 if size <= 64 else 2  # (big: fewer is plenty)
+        masks = logo_masks(size, samples=samples, arrow=image is None)
+        return masks, (pointer_layer(size, image) if image else {})
+
+    def set_size(self, icon, points=None):
+        """Make the icon `icon` pixels across, and the name `points` big (if given)."""
+        self.wanted = (max(20, int(icon)), points)
+        if self.wanted == (self.icon, self.points):
+            if self.job is not None:  # (back where it is: nothing to do)
+                self.after_cancel(self.job)
+                self.job = None
+            return
+        if self.shown is None or not self.winfo_ismapped():
+            # not on screen yet, like when the app starts: straight away, so it never
+            # appears at the wrong size
+            if self.wanted[0] not in self.shapes:
+                self.shapes[self.wanted[0]] = self.shapes_for(self.wanted[0])
+            self.take_size()
+            return
+        if self.job is not None:
+            self.after_cancel(self.job)
+        self.job = self.after(self.WAIT_MS, self.work_out)
+
+    def work_out(self):
+        """The size has stayed put: get the shapes for it (in the background if they're
+        new), then take the new size."""
+        self.job = None
+        size = self.wanted[0]
+        if size in self.shapes:
+            self.take_size()
+            return
+        if self.working is not None:  # (one at a time: try again when it's done)
+            self.job = self.after(self.WAIT_MS, self.work_out)
+            return
+        working = self.working = [size, None]
+
+        def run():
+            working[1] = self.shapes_for(size)
+        threading.Thread(target=run, daemon=True).start()
+        self.after(30, self.collect)
+
+    def collect(self):
+        size, result = self.working
+        if result is None:
+            self.after(30, self.collect)
+            return
+        self.working = None
+        if len(self.shapes) > 12:  # (only keep a few sizes)
+            self.shapes = {k: v for k, v in self.shapes.items() if k in (self.ICON, size)}
+        self.shapes[size] = result
+        if size == self.wanted[0]:
+            if self.job is None:  # (unless it's being dragged again)
+                self.take_size()
+        elif self.job is None:
+            self.job = self.after(self.WAIT_MS, self.work_out)
+
+    def take_size(self):
+        icon, points = self.wanted
+        if points is not None and int(self.font.cget("size")) != points:
+            self.font.configure(size=points)
+        f = tkfont.Font(font=self.font)
+        self.configure(height=max(icon, f.metrics("linespace") * 2),
+                       width=icon + self.GAP + f.measure(self.NAME) + 4)
+        self.icon, self.points = icon, points
+        if self.shown is None or self.shown[0] != icon:
+            self.shown = (icon, *self.shapes[icon])
+            self.image = tk.PhotoImage(width=icon, height=icon)
+            self.redraw()
+        else:
+            self.place()
+        if self.on_resize:
+            self.on_resize()
 
     def set_palette(self, palette):
         self.palette = palette
         self.configure(bg=palette["bg"])
         self.redraw()
 
-    def refit(self):
-        """The text size changed: fit the logo to it again."""
-        f = tkfont.Font(font=self.font)
-        self.configure(height=max(self.ICON, f.metrics("linespace") * 2),
-                       width=self.ICON + self.GAP + f.measure(self.NAME) + 4)
-        self.redraw()
-
     def redraw(self):
-        self.delete("all")
-        if not self.palette:
+        """Paint the picture in the current colours (slow-ish), then place it."""
+        if not self.palette or self.shown is None:
             return
+        size, masks, pointer = self.shown
         p = self.palette
         bg = [int(p["bg"][i:i + 2], 16) for i in (1, 3, 5)]
-        colors = logo_colors(p["accent"])
+        # (the same sums as logo_pixel, with each part's colour worked out once per row:
+        # this is redrawn on every frame of the light/dark fade, so it has to be quick)
+        def rgb(color):
+            return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+        solid, gradients = {}, {}
+        for name, color in logo_colors(p["accent"]).items():
+            if isinstance(color, tuple):
+                gradients[name] = (rgb(color[0]), rgb(color[1]))
+            else:
+                solid[name] = rgb(color)
         rows = []
-        for y, row in enumerate(self.masks):
-            down = (y + 0.5) / self.ICON
+        for y, row in enumerate(masks):
+            down = (y + 0.5) / size
+            here = dict(solid)
+            for name, (top, bottom) in gradients.items():
+                here[name] = tuple(a + (b - a) * down for a, b in zip(top, bottom))
             pixels = []
             for x, parts in enumerate(row):
-                rgb = logo_pixel(parts, colors, bg, down)[0]
-                if (x, y) in self.pointer:
-                    rgb = over(self.pointer[x, y], rgb, 1.0)[0]
-                pixels.append("#%02x%02x%02x" % rgb)
+                rest = 1.0
+                r, g, b = 0.0, 0.0, 0.0
+                for name, amount in parts.items():
+                    c = here[name]
+                    r, g, b = r + c[0] * amount, g + c[1] * amount, b + c[2] * amount
+                    rest -= amount
+                color = (round(r + bg[0] * rest), round(g + bg[1] * rest),
+                         round(b + bg[2] * rest))
+                if (x, y) in pointer:
+                    color = over(pointer[x, y], color, 1.0)[0]
+                pixels.append("#%02x%02x%02x" % color)
             rows.append("{" + " ".join(pixels) + "}")
         self.image.put(" ".join(rows))
+        self.place()
 
+    def place(self):
+        """Put the picture and the name in their places (after a resize: quick)."""
+        self.delete("all")
+        if not self.palette or self.shown is None:
+            return
         h = self.winfo_height()
-        self.create_image(0, (h - self.ICON) // 2, image=self.image, anchor="nw")
-        x = self.ICON + self.GAP
-        self.create_text(x, h / 2, text=self.NAME, anchor="w", fill=p["fg"], font=self.font)
+        icon = self.icon  # (the old picture sits in the middle of the new size's room)
+        self.create_image(icon // 2, h // 2, image=self.image, anchor="center")
+        self.create_text(icon + self.GAP, h / 2, text=self.NAME, anchor="w",
+                         fill=self.palette["fg"], font=self.font)
 
 
 _corner_cache = {}
@@ -4723,6 +4828,8 @@ class SidebarHandle(tk.Canvas):
     back to its normal size."""
 
     WIDTH = 7  # how wide the grabbable strip is; the line is drawn in its middle
+    HOVER_WAIT = 300  # ms of hovering before it lights up (just passing over is quicker)
+    FADE_MS = 150     # how long lighting up (or going back) takes
 
     def __init__(self, parent, on_drag, on_release, on_reset):
         super().__init__(parent, width=self.WIDTH, highlightthickness=0, bd=0,
@@ -4731,6 +4838,8 @@ class SidebarHandle(tk.Canvas):
         self.palette = None
         self.hover = False
         self.dragging = False
+        self.glow = 0.0       # 0: grey, 1: accent colour (see fade_to)
+        self.glow_job = None
         self.vertical = True  # False when the menu is along the top or bottom
         self.bind("<Configure>", lambda e: self.redraw())
         self.bind("<Enter>", lambda e: self.set_hover(True))
@@ -4752,7 +4861,29 @@ class SidebarHandle(tk.Canvas):
 
     def set_hover(self, hover):
         self.hover = hover
+        if self.glow_job is not None:
+            self.after_cancel(self.glow_job)
+            self.glow_job = None
+        if hover:  # still here after a moment: light up
+            self.glow_job = self.after(self.HOVER_WAIT, lambda: self.fade_to(1.0))
+        else:
+            self.fade_to(0.0)
         self.redraw()
+
+    def fade_to(self, target):
+        """Fade the line towards the accent colour (1) or back to grey (0)."""
+        if self.glow_job is not None:
+            self.after_cancel(self.glow_job)
+            self.glow_job = None
+        start, began = self.glow, time.monotonic()
+
+        def step():
+            t = min(1.0, (time.monotonic() - began) * 1000 / self.FADE_MS)
+            self.glow = start + (target - start) * t * t * (3 - 2 * t)
+            self.redraw()
+            self.glow_job = self.after(15, step) if t < 1 else None
+        if start != target:
+            step()
 
     def start_drag(self, _event):
         self.dragging = True
@@ -4780,10 +4911,12 @@ class SidebarHandle(tk.Canvas):
             else:
                 self.create_rectangle(0, mid - before, w, mid + after, fill=color, outline="")
 
-        if self.dragging:  # accent only while it's actually being dragged
+        if self.dragging:
             line(1, 2, self.palette["accent"])
-        elif self.hover:  # just passing over: a slightly thicker grey line shows it can be dragged
-            line(1, 1, self.palette["muted"])
+        elif self.glow > 0:  # the mouse stayed on it: it fades into the accent colour
+            # (see set_hover), and gets thicker as it does
+            color = mix_color(self.palette["border"], self.palette["accent"], self.glow)
+            line(1 if self.glow > 0.3 else 0, 2 if self.glow > 0.6 else 1, color)
         else:
             line(0, 1, self.palette["border"])
 
@@ -5310,7 +5443,8 @@ class AutoClicker:
         self.content = content
 
         # Menu: logo, page buttons, then the status at the far end
-        self.logo = self.register(Logo(sidebar, self.font_brand))
+        self.logo = self.register(Logo(sidebar, self.font_brand,
+                                       on_resize=lambda: self.keep_bar_room()))
         pages = (("clicker", "Mouse"), ("areas", "Areas"), ("macros", "Macros"),
                  ("keyboard", "Keyboard"), ("recording", "Profiles"), ("settings", "Settings"))
         # the page buttons sit together in a rounded card, with thin lines between them
@@ -5338,6 +5472,7 @@ class AutoClicker:
         # always-visible reminder of the emergency stop
         self.esc_hint = ttk.Label(sidebar, text="Esc stops everything", style="Muted.TLabel",
                                   justify="left")
+        self.mini_switch = self.make_switch(sidebar, "Mini mode", self.mini)
         self.sidebar_width = saved["sidebar_width"]
         self.bar_height = saved["bar_height"]
         self.layout_sidebar()
@@ -6243,8 +6378,6 @@ class AutoClicker:
                       value=lambda p: self.make_combo(p, self.text_size, list(TEXT_SIZES)))
         self.card_row(card, "Menu position",
                       value=lambda p: self.make_combo(p, self.sidebar_side, list(SIDEBAR_SIDES)))
-        self.card_row(card, "Mini mode", self.mini,
-                      subtitle="A small window with just the mouse clicker")
 
         card = self.card_section(sub, 4, "Badge")
         self.card_row(card, "Show",
@@ -6406,6 +6539,8 @@ class AutoClicker:
             # reaches about halfway down the menu (see size_nav_buttons)
             self.nav_card.grid(row=1, column=0, rowspan=1, sticky="ew", padx=0, pady=0)
             bar.rowconfigure(2, weight=1)  # pushes the status to the bottom
+            self.mini_switch.set_text("Mini mode")
+            self.mini_switch.grid(row=2, column=0, sticky="nw", padx=4, pady=(12, 0))
             self.status_row.grid(row=3, column=0, sticky="ew", padx=0, pady=(10, 2))
             self.esc_hint.grid(row=4, column=0, sticky="w", padx=0, pady=(4, 0))
             self.set_sidebar_width(self.sidebar_width)
@@ -6414,6 +6549,8 @@ class AutoClicker:
             self.logo.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 16), pady=0)
             self.nav_card.grid(row=0, column=1, rowspan=2, sticky="", padx=0, pady=0)
             bar.columnconfigure(2, weight=1)  # pushes the status to the far end
+            self.mini_switch.set_text("Mini")  # (short, so the bar stays narrow)
+            self.mini_switch.grid(row=0, column=2, rowspan=2, sticky="w", padx=(12, 0), pady=0)
             # status and Esc hint stay together in the middle, however tall the bar is
             bar.rowconfigure(0, weight=1)
             bar.rowconfigure(1, weight=1)
@@ -6436,7 +6573,7 @@ class AutoClicker:
         for font, extra in ((self.font_title, 5), (self.font_brand, 1), (self.font_section, 1),
                             (self.font_caption, -1), (self.font_nav, 0)):
             font.configure(size=base + extra)
-        self.logo.refit()
+        self.size_logo()
         if self.badge is not None:
             self.badge.title_font.configure(size=base)
             self.badge.detail_font.configure(size=max(base - 1, 7))
@@ -6503,11 +6640,33 @@ class AutoClicker:
         if changed or (self.nav_card.fit and self.nav_card.winfo_width() <= 1):
             self.nav_card.fit_to_body()
 
+    def size_logo(self):
+        """The logo grows and shrinks with the menu: with a side menu's width, or a
+        top/bottom menu's height (its name too, starting from the text size setting)."""
+        base = TEXT_SIZES.get(self.text_size.get(), FONT_SIZE) + 1
+
+        def size(scale):  # (icon, name size) at this scale
+            return round(Logo.ICON * scale / 2) * 2, max(7, round(base * scale))
+        if self.menu_is_vertical():
+            scale = min(self.sidebar_width / DEFAULTS["sidebar_width"], 1.6)
+            room = self.sidebar_width - 16  # (the menu's padding)
+            measure = tkfont.Font(font=self.font_brand)
+            while scale > 0.4:  # a narrow menu: smaller until it fits
+                icon, points = size(scale)
+                measure.configure(size=points)
+                if icon + Logo.GAP + measure.measure(Logo.NAME) + 4 <= room:
+                    break
+                scale -= 0.05
+        else:
+            scale = min(max((self.bar_height - 18) / Logo.ICON, 1.0), 2.0)
+        self.logo.set_size(*size(scale))
+
     def set_sidebar_width(self, width):
         width = int(min(max(width, SIDEBAR_MIN), SIDEBAR_MAX))
         self.sidebar_width = width
         if not self.menu_is_vertical() or self.mini_shown:
             return  # a top/bottom menu just fits its contents
+        self.size_logo()
         self.root.columnconfigure(self.sidebar_index, minsize=width)
         self.status.configure(wraplength=width - 40)  # text wraps to fit the sidebar
         self.esc_hint.configure(wraplength=width - 24)
@@ -6521,11 +6680,18 @@ class AutoClicker:
         if self.menu_is_vertical() or self.mini_shown:
             return
         self.root.rowconfigure(self.sidebar_index, minsize=height)
+        self.size_logo()
         self.size_nav_buttons()
-        # the bar takes some height, so the window keeps room for the page below it
+        self.keep_bar_room()
+
+    def keep_bar_room(self):
+        """A top/bottom menu takes some height, and is as wide as its contents: the window
+        keeps room for it, and for the page below it."""
+        if self.menu_is_vertical() or self.mini_shown or not hasattr(self, "sidebar_index"):
+            return
         self.sidebar.update_idletasks()
         self.root.minsize(max(PAGE_MIN_WIDTH, self.sidebar.winfo_reqwidth()),
-                          MIN_SIZE[1] + BAR_EXTRA_HEIGHT + height - BAR_MIN)
+                          MIN_SIZE[1] + BAR_EXTRA_HEIGHT + self.bar_height - BAR_MIN)
 
     def drag_sidebar(self, x_root, y_root):
         """The line between the menu and the page is being dragged to here."""
@@ -6567,6 +6733,7 @@ class AutoClicker:
 
     def show_page(self):
         current = self.page.get()
+        self.pages[current].grid()  # (back on screen, if a light/dark fade took it off)
         self.pages[current].tkraise()
         for name, btn in self.nav_buttons.items():
             btn.set_selected(name == current)
@@ -6729,8 +6896,19 @@ class AutoClicker:
         self.root.attributes("-topmost", bool(self.on_top.get()) or self.mini_shown)
 
     # ---------------- Theme ----------------
-    def apply_palette(self, p: dict):
-        """Apply one set of colours to every widget style and custom widget."""
+    def hidden_parts(self):
+        """Widget paths of what's not on screen right now: the other pages, and mini mode
+        or the full window (whichever isn't showing). A widget inside one is hidden."""
+        hidden = [str(frame) for name, frame in self.pages.items() if name != self.page.get()]
+        if self.mini_shown:
+            hidden += [str(self.sidebar), str(self.content)]
+        else:
+            hidden.append(str(self.mini_frame))
+        return tuple(path + "." for path in hidden)
+
+    def apply_palette(self, p: dict, skip=()):
+        """Apply one set of colours to every widget style and custom widget. skip: leave
+        out custom widgets inside these (see hidden_parts), for the frames of a fade."""
         self.palette = p
         s = self.style
         self.root.configure(bg=p["bg"])
@@ -6749,13 +6927,16 @@ class AutoClicker:
         s.configure("CardCaption.TLabel", background=p["card"], foreground=p["muted"],
                     font=self.font_caption)
         for frame in self.card_frames:
-            frame.configure(bg=p["card"])
+            if not skip or not str(frame).startswith(skip):
+                frame.configure(bg=p["card"])
         for line in self.dividers:
-            line.configure(bg=p["divider"])
+            if not skip or not str(line).startswith(skip):
+                line.configure(bg=p["divider"])
 
         card_palette = self.surface_palette("card")
         for widget in self.round_widgets:
-            widget.set_palette(card_palette if widget.surface == "card" else p)
+            if not skip or not str(widget).startswith(skip):
+                widget.set_palette(card_palette if widget.surface == "card" else p)
         for window in self.root.winfo_children():
             if isinstance(window, ScreenLayer):  # the Areas or Macros menu, if it's open
                 window.set_accent(p["accent"])
@@ -6773,10 +6954,17 @@ class AutoClicker:
             self.theme_job = None
         start = dict(self.palette)
         began = time.monotonic()
+        hidden = self.hidden_parts()  # (redrawing these every frame made it judder)
+        # the other pages sit under this one: off the screen during the fade, so they
+        # aren't redrawn every frame too (they're put back, in the new colours, at the end)
+        for name, frame in self.pages.items():
+            if name != self.page.get():
+                frame.grid_remove()
 
         def step():
             # timed by the clock, so the fade always takes THEME_MS even if frames are slow
-            t = min(1.0, (time.monotonic() - began) * 1000 / THEME_MS)
+            frame_began = time.monotonic()
+            t = min(1.0, (frame_began - began) * 1000 / THEME_MS)
             eased = t * t * (3 - 2 * t)  # smoothstep: gentle start and end
             # Text doesn't fade: fading it along with the background would turn both the
             # same grey halfway and the words would vanish. It swaps at the halfway point
@@ -6784,11 +6972,17 @@ class AutoClicker:
             self.apply_palette({
                 k: (target[k] if eased >= 0.5 else start[k]) if k in TEXT_COLORS
                 else mix_color(start[k], target[k], eased)
-                for k in target})
-            if t < 1:
-                self.theme_job = self.root.after(max(1, THEME_MS // THEME_STEPS), step)
+                for k in target}, skip=hidden if t < 1 else ())  # the end: everything
+            if t < 1:  # the next frame: the time this one took counts towards the wait
+                self.root.update_idletasks()
+                took = (time.monotonic() - frame_began) * 1000
+                self.theme_job = self.root.after(max(1, int(THEME_MS / THEME_STEPS - took)),
+                                                 step)
             else:
                 self.theme_job = None
+                for frame in self.pages.values():
+                    frame.grid()
+                self.pages[self.page.get()].tkraise()
 
         step()
 
