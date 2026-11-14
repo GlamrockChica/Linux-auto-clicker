@@ -7,10 +7,13 @@ Settings file: ~/.config/autoclicker/settings.json
 
 import base64
 import colorsys
+import ctypes
+import ctypes.util
 import json
 import math
 import os
 import queue
+import random
 import re
 import shutil
 import signal
@@ -94,7 +97,7 @@ PROFILES_MARKER = ".autoclicker-profiles"
 AREAS_MARKER = ".autoclicker-areas"
 MACROS_MARKER = ".autoclicker-macros"
 
-APP_VERSION = "3.4"  # bump this for each GitHub release, and tag the release "v" + this
+APP_VERSION = "3.5"  # bump this for each GitHub release, and tag the release "v" + this
 GITHUB_REPO = "GlamrockChica/Linux-auto-clicker"
 GITHUB_PAGE = f"https://github.com/{GITHUB_REPO}"
 APP_CLASS = "autoclicker"  # window class; install.sh sets StartupWMClass to match
@@ -128,6 +131,16 @@ DEFAULTS = {
     "area_return": True,       # put the mouse back after each area click
     "area_in_order": False,    # click one shape's spots, then the next shape's (see AreaPlan)
     "hold": False,             # hold the button down instead of clicking
+    "burst_on": False,         # click in bursts: a number of clicks, then a rest, and again
+    "burst_clicks": 20,        # clicks in each burst
+    "burst_rest": 5.0,         # seconds of rest between bursts
+    "trigger_on": False,       # colour trigger: only click while a colour is (or isn't)
+                               # in a box on the screen
+    "trigger_box": None,       # [x1, y1, x2, y2]: where on the screen it watches
+    "trigger_color": "",       # the colour it watches for, "#rrggbb"
+    "trigger_when": "In the box",  # click while the colour is: see TRIGGER_WHEN
+    "trigger_tolerance": 20,   # how far off a colour can be and still count (0-255)
+    "stats": {},               # what Pengclick has done in total, see clean_stats
     # macros
     "macro": [],               # the clicks, in order: {"button": "Left", "x": 10, "y": 20}
     "macro_wait": 0.5,         # seconds between its clicks
@@ -173,6 +186,16 @@ DEFAULTS = {
     "check_updates": True,     # look for a newer version on GitHub when the app starts
     "text_size": "Normal",     # Small / Normal / Large
     "dark_mode": False,
+    # A hidden easter egg: true shows "Super secret options" at the bottom of Settings.
+    # It's only here, never in the app; the app notices when it's changed, even while
+    # it's open (see check_settings_file).
+    "super_secret_options": False,
+    "retro_mode": False,       # Super secret options > Retro mode: the very first
+                               # version's look (see classic_look)
+    "win95_mode": False,       # Super secret options > Win 95 mode: like retro, but as if
+                               # it ran on Windows 95 (see win95_look)
+    "win1_mode": False,        # Super secret options > Win 1 mode: Windows 1.0 (win1_look)
+    "win11_mode": False,       # Super secret options > Win 11 mode (see win11_look)
     "accent": "#4a8fd9",
     "sidebar_width": 150,      # dragged with the handle between sidebar and page
     "bar_height": BAR_MIN,     # the same, for a menu along the top or bottom
@@ -383,6 +406,57 @@ def clean_recording(recording):
     return good or None
 
 
+TRIGGER_WHEN = ("In the box", "Not in the box")  # colour trigger: click while the colour is...
+STAT_NAMES = ("clicks", "presses", "runs", "seconds", "last_count", "last_seconds")
+
+
+def clean_stats(stats) -> dict:
+    """The click stats (Settings > Stats): all numbers, 0 if missing. last_unit is what
+    the last run did: "click" or "press"."""
+    stats = stats if isinstance(stats, dict) else {}
+    clean = {}
+    for name in STAT_NAMES:
+        value = stats.get(name, 0)
+        clean[name] = value if isinstance(value, (int, float)) and value >= 0 else 0
+    clean["last_unit"] = "press" if stats.get("last_unit") == "press" else "click"
+    return clean
+
+
+def grab_screen(x, y, w, h, display=None):
+    """The screen's pixels in a box, as bytes: blue, green, red and a spare byte for each
+    pixel, row by row. None if it couldn't (no X, or the box is off the screen).
+    display: an Xlib display to use (otherwise one is opened just for this)."""
+    try:
+        from Xlib import X, display as xdisplay
+        d = display or xdisplay.Display()
+    except Exception:
+        return None
+    try:
+        screen = d.screen()
+        x, y = max(0, int(x)), max(0, int(y))
+        w = max(1, min(int(w), screen.width_in_pixels - x))
+        h = max(1, min(int(h), screen.height_in_pixels - y))
+        image = screen.root.get_image(x, y, w, h, X.ZPixmap, 0xffffffff)
+        return image.data if image.depth >= 24 else None
+    except Exception:
+        return None
+    finally:
+        if display is None:
+            d.close()
+
+
+def colour_in(data, target, tolerance, step=1):
+    """True if any pixel of `data` (see grab_screen) is the colour (r, g, b), give or take
+    `tolerance` on each of red, green and blue. step: only look at every so many pixels."""
+    r0, g0, b0 = target
+    jump = 4 * step
+    for blue, green, red in zip(data[0::jump], data[1::jump], data[2::jump]):
+        if (abs(red - r0) <= tolerance and abs(green - g0) <= tolerance
+                and abs(blue - b0) <= tolerance):
+            return True
+    return False
+
+
 def clean_settings(saved, base=None) -> dict:
     """Merge saved values over `base` (default: DEFAULTS), fixing anything missing or invalid."""
     settings = dict(base or DEFAULTS)
@@ -410,6 +484,10 @@ def clean_settings(saved, base=None) -> dict:
             area = [{"type": "rectangle", "points": [x, y, x + w, y + h]}]
         settings["area"] = clean_shapes(area if isinstance(area, list) else [])
         settings["macro"] = clean_macro(saved.get("macro"))
+        box = saved.get("trigger_box")
+        settings["trigger_box"] = ([int(v) for v in box] if isinstance(box, list)
+                                   and len(box) == 4
+                                   and all(isinstance(v, (int, float)) for v in box) else None)
         if "recording" in saved:
             settings["recording"] = clean_recording(saved.get("recording"))
         # Older settings files used "limit": 0 to mean "never stop"
@@ -419,9 +497,16 @@ def clean_settings(saved, base=None) -> dict:
         for name in APP_KEYS:
             if re.fullmatch(r"F\d+", settings[name]):
                 settings[name] = "key:" + settings[name].lower()
-    for name in ("limit", "kb_limit", "replay_limit", "macro_limit"):
+    for name in ("limit", "kb_limit", "replay_limit", "macro_limit", "burst_clicks"):
         if settings[name] < 1:
             settings[name] = DEFAULTS[name]
+    settings["burst_rest"] = min(max(settings["burst_rest"], 0.0), 3600.0)
+    if not is_hex_color(settings["trigger_color"]):
+        settings["trigger_color"] = ""
+    if settings["trigger_when"] not in TRIGGER_WHEN:
+        settings["trigger_when"] = DEFAULTS["trigger_when"]
+    settings["trigger_tolerance"] = min(max(settings["trigger_tolerance"], 0), 255)
+    settings["stats"] = clean_stats(settings["stats"])
     settings["sidebar_width"] = min(max(settings["sidebar_width"], SIDEBAR_MIN), SIDEBAR_MAX)
     settings["bar_height"] = min(max(settings["bar_height"], BAR_MIN), BAR_MAX)
     for name in ("click_delay", "time_limit", "kb_time_limit"):
@@ -464,6 +549,12 @@ def clean_settings(saved, base=None) -> dict:
             settings["active_mode"] = "replay"
         elif saved.get("kb_on"):
             settings["active_mode"] = "keyboard"
+    if isinstance(saved, dict) and saved.get("classic") and "retro_mode" not in saved:
+        # (for a while the retro look was a hidden "classic" switch of its own)
+        settings["retro_mode"] = settings["super_secret_options"] = True
+    looks = [k for k in ("win95_mode", "win1_mode", "win11_mode", "retro_mode") if settings[k]]
+    for name in looks[1:]:  # (one look at a time)
+        settings[name] = False
     if not is_hex_color(settings["accent"]):
         settings["accent"] = DEFAULTS["accent"]
     settings["accent"] = settings["accent"].lower()
@@ -1317,6 +1408,314 @@ def build_palette(dark: bool, accent: str) -> dict:
     return p
 
 
+_classic = [False]  # the retro look is on (Settings > Super secret options > Retro mode)
+
+
+def classic_look() -> bool:
+    """True while the app has the very first version's look: plain old Tk, grey, with 3D
+    raised buttons and sunken boxes (see classic_box). Every widget checks this."""
+    return _classic[0]
+
+
+def classic_palette() -> dict:
+    """The colours of the very first version (the retro look, see classic_look): Tk's own
+    plain grey, black text, white boxes, and everything flat on the page (the cards are
+    the page's own colour, with no lines between their rows)."""
+    p = dict(LIGHT)
+    p.update(bg="#d9d9d9", fg="#000000", field="#ffffff", button="#d9d9d9",
+             active="#ececec", border="#7f7f7f", muted="#4d4d4d", card="#d9d9d9",
+             card_field="#ffffff", divider="#d9d9d9", accent="#4a6984", accent_fg="#ffffff",
+             select="#c3c3c3", select_fg="#000000")
+    return p
+
+
+# ---- Super Secret Settings: a random colour filter over the whole app ----
+# (like the button in old Minecraft's video settings: each click picks another filter)
+def _grey(r, g, b):
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def _hue_flip(r, g, b):
+    h, sat, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+    return tuple(c * 255 for c in colorsys.hsv_to_rgb((h + 0.5) % 1, sat, v))
+
+
+SCREEN_FILTERS = {  # name: what it does to one colour (r, g, b, each 0..255)
+    "Inverted": lambda r, g, b: (255 - r, 255 - g, 255 - b),
+    "Black and white": lambda r, g, b: (_grey(r, g, b),) * 3,
+    "Old photo": lambda r, g, b: (r * .393 + g * .769 + b * .189, r * .349 + g * .686 + b * .168,
+                                  r * .272 + g * .534 + b * .131),
+    "Night vision": lambda r, g, b: (_grey(r, g, b) * .1, 20 + _grey(r, g, b) * .65,
+                                     _grey(r, g, b) * .1),
+    "Hue flip": _hue_flip,
+    "Colour swap": lambda r, g, b: (b, r, g),
+    "Pumpkin": lambda r, g, b: (40 + _grey(r, g, b), 10 + _grey(r, g, b) * .55,
+                                _grey(r, g, b) * .1),
+    "Frozen": lambda r, g, b: (_grey(r, g, b) * .7, 15 + _grey(r, g, b) * .9,
+                               50 + _grey(r, g, b)),
+    "8 colours": lambda r, g, b: tuple(255 if c > 127 else 0 for c in (r, g, b)),
+    "Washed out": lambda r, g, b: tuple(c + (_grey(r, g, b) - c) * .7 + 25 for c in (r, g, b)),
+    "Colour blind": lambda r, g, b: (r * .625 + g * .375, r * .7 + g * .3, g * .3 + b * .7),
+}
+_screen_filter = [None]  # the filter that's on (a SCREEN_FILTERS function), if any
+
+
+def screen_rgb(rgb):
+    """A colour (r, g, b) through the Super Secret Settings filter, if one is on."""
+    if _screen_filter[0] is None:
+        return tuple(rgb)
+    return tuple(max(0, min(255, round(c))) for c in _screen_filter[0](*rgb))
+
+
+def screen_color(color: str) -> str:
+    """A hex colour through the Super Secret Settings filter, if one is on."""
+    if _screen_filter[0] is None or not is_hex_color(color):
+        return color
+    return "#%02x%02x%02x" % screen_rgb(int(color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def filter_palette(p: dict) -> dict:
+    """A whole palette through the Super Secret Settings filter, if one is on."""
+    return {key: screen_color(value) for key, value in p.items()}
+
+
+_old_windows = [None]  # "95" in Win 95 mode, "1" in Win 1 mode (both: classic_look too)
+
+
+def win95_look() -> bool:
+    """True in Win 95 mode: the retro look (classic_look is True too), but as if the app
+    ran on Windows 95: only the old 16 colours, 2-pixel 3D edges, text with no smoothing
+    (jagged, pixel by pixel) and a pixel-art penguin in a navy title bar."""
+    return _old_windows[0] == "95"
+
+
+def win1_look() -> bool:
+    """True in Win 1 mode: as if the app ran on Windows 1.0 (1985): white, flat, with thin
+    black outlines (no 3D edges yet), round-cornered buttons, X tick boxes, chunky bold
+    pixel text and a blue title bar with the name in the middle."""
+    return _old_windows[0] == "1"
+
+
+_win11 = [False]  # Win 11 mode is on (see win11_look)
+
+
+def win11_look() -> bool:
+    """True in Win 11 mode: the normal look, but as if the app ran on Windows 11: its
+    greys ("Mica"), small 4px corners with a line under boxes, Windows 11's switches, a
+    little accent bar by the page you're on, its font if there is one like it, and its
+    own title bar (with a red close button)."""
+    return _win11[0]
+
+
+WIN11_FONTS = ("Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", "Selawik",
+               "Hindoe UI")  # (the first one found; otherwise the normal font)
+
+
+def win11_palette(dark: bool, accent: str) -> dict:
+    """Win 11 mode's colours: its light or dark greys, with the chosen accent colour."""
+    p = build_palette(dark, accent)
+    if dark:
+        p.update(bg="#202020", fg="#ffffff", field="#2d2d2d", button="#2d2d2d",
+                 active="#373737", border="#3b3b3b", muted="#c5c5c5", card="#2b2b2b",
+                 card_field="#333333", divider="#1f1f1f")
+    else:
+        p.update(bg="#f3f3f3", fg="#1b1b1b", field="#ffffff", button="#fbfbfb",
+                 active="#f5f5f5", border="#e0e0e0", muted="#5d5d5d", card="#fbfbfb",
+                 card_field="#ffffff", divider="#ebebeb")
+    return p
+
+
+def win11_underline(canvas, x1, x2, y2, r, active, p):
+    """Windows 11 puts a line along the bottom of a box: grey, or a thicker accent line
+    while it's being used. (Nothing in the other looks.)"""
+    if not win11_look():
+        return
+    if active:
+        canvas.create_line(x1 + r, y2 - 1, x2 - r, y2 - 1, fill=p["accent"], width=2)
+    else:
+        canvas.create_line(x1 + r, y2, x2 - r, y2, fill=mix_color(p["border"], p["fg"], 0.4))
+
+
+def render_switch_win11(image, w, h, pos, p, hover=False):
+    """Windows 11's switch, pixel by pixel with smooth edges: off, an outlined track with
+    a small dark knob; on, a track filled with the accent colour and a slightly bigger
+    knob in the accent's text colour."""
+    def rgb(color):
+        return [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+
+    def coverage(distance):  # distance < 0 is inside
+        return min(max(0.5 - distance, 0.0), 1.0)
+    bg, accent = rgb(p["bg"]), rgb(p["accent"])
+    ring = rgb(mix_color(p["fg"], p["bg"], 0.45))
+    knob_color = [a + (b - a) * pos for a, b in zip(ring, rgb(p["accent_fg"]))]
+    r = h / 2
+    kr = min(r - 3, 5 + pos * 1.5 + (0.75 if hover else 0))
+    kx, ky = r + pos * (w - 2 * r), h / 2
+    rows = []
+    for y in range(h):
+        py = y + 0.5
+        row = []
+        for x in range(w):
+            px = x + 0.5
+            cx = min(max(px, r), w - r)
+            d = math.hypot(px - cx, py - r) - r
+            outer, inner = coverage(d), coverage(d + 1)  # (inner: 1 pixel in)
+            edge = outer - inner
+            knob = coverage(math.hypot(px - kx, py - ky) - kr)
+            color = []
+            for c in range(3):
+                v = bg[c] + (accent[c] - bg[c]) * inner * pos  # filled when on
+                line = ring[c] + (accent[c] - ring[c]) * pos   # the edge: grey, then accent
+                v += (line - v) * edge
+                v += (knob_color[c] - v) * knob
+                color.append(round(v))
+            row.append("#%02x%02x%02x" % tuple(color))
+        rows.append("{" + " ".join(row) + "}")
+    image.put(" ".join(rows))
+
+
+def old_windows_look() -> bool:
+    """Win 95 or Win 1 mode: the app has its own title bar and border, and no smooth text."""
+    return _old_windows[0] is not None
+
+
+VGA_COLORS = ("#000000", "#800000", "#008000", "#808000", "#000080", "#800080", "#008080",
+              "#c0c0c0", "#808080", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff",
+              "#00ffff", "#ffffff")  # the 16 colours Windows 95 had in its plainest mode
+WIN95_FONTS = ("Arial", "Liberation Sans", "Arimo", "DejaVu Sans")  # first one found
+
+
+def win1_palette() -> dict:
+    """Win 1 mode's colours (from the old EGA screens' 16): white everywhere, black text
+    and lines, a blue title bar, and things picked shown black with white text."""
+    p = dict(LIGHT)
+    p.update(bg="#ffffff", fg="#000000", field="#ffffff", button="#ffffff",
+             active="#ffffff", border="#000000", muted="#000000", card="#ffffff",
+             card_field="#ffffff", divider="#ffffff", accent="#0000aa", accent_fg="#ffffff",
+             select="#000000", select_fg="#ffffff")
+    return p
+
+
+def win95_palette() -> dict:
+    """Win 95 mode's colours, all from VGA_COLORS: grey, black text, white boxes, and
+    navy for what's chosen (with white text on it)."""
+    p = dict(LIGHT)
+    p.update(bg="#c0c0c0", fg="#000000", field="#ffffff", button="#c0c0c0",
+             active="#c0c0c0", border="#808080", muted="#000000", card="#c0c0c0",
+             card_field="#ffffff", divider="#c0c0c0", accent="#000080", accent_fg="#ffffff",
+             select="#000080", select_fg="#ffffff")
+    return p
+
+
+_fontconfig = []  # the fontconfig library, once loaded (see set_text_smoothing)
+
+
+def set_text_smoothing(on):
+    """Turn the smoothing (anti-aliasing) of all text on or off, straight away: off, the
+    letters are drawn in whole pixels, as Windows 95 did. (It swaps fontconfig's settings
+    for a copy of the computer's own with or without smoothing; fonts made from then on
+    use it.) Returns False if it couldn't."""
+    try:
+        if not _fontconfig:
+            name = ctypes.util.find_library("fontconfig") or "libfontconfig.so.1"
+            lib = ctypes.CDLL(name)
+            lib.FcConfigCreate.restype = ctypes.c_void_p
+            lib.FcConfigParseAndLoadFromMemory.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                                           ctypes.c_int]
+            lib.FcConfigBuildFonts.argtypes = [ctypes.c_void_p]
+            lib.FcConfigSetCurrent.argtypes = [ctypes.c_void_p]
+            _fontconfig.append(lib)
+        lib = _fontconfig[0]
+        system = os.environ.get("FONTCONFIG_FILE") or "/etc/fonts/fonts.conf"
+        rough = "" if on else (
+            '<match target="pattern">'
+            '<edit name="antialias" mode="assign"><bool>false</bool></edit>'
+            '<edit name="hinting" mode="assign"><bool>true</bool></edit>'
+            '<edit name="hintstyle" mode="assign"><const>hintfull</const></edit>'
+            '<edit name="autohint" mode="assign"><bool>false</bool></edit></match>')
+        xml = ('<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "fonts.dtd"><fontconfig>'
+               f'<include ignore_missing="yes">{system}</include>{rough}</fontconfig>')
+        config = lib.FcConfigCreate()
+        if not config or not lib.FcConfigParseAndLoadFromMemory(config, xml.encode(), 1):
+            return False
+        lib.FcConfigBuildFonts(config)
+        return bool(lib.FcConfigSetCurrent(config))
+    except (OSError, AttributeError, ctypes.ArgumentError):
+        return False
+
+
+_pixel_penguin = []  # (masks, colours) for the 16x16 penguin, see pixel_penguin
+
+
+def pixel_penguin():
+    """Win 95 mode's little penguin: 16x16 pixels, each one a single colour (no smooth
+    edges), black and white with a yellow beak and feet. A list of rows of colours, or
+    None for a see-through pixel."""
+    if not _pixel_penguin:
+        size = 16
+        masks = logo_masks(size, samples=1, arrow=False)  # (1 sample: no in-between pixels)
+        colors = logo_colors("#000000")
+        colors.update(body=("#000000", "#000000"), flipper=("#000000", "#000000"),
+                      beak="#ffff00", feet="#ffff00", face="#ffffff", eye="#000000",
+                      shine="#ffffff")
+        rows = []
+        for y, row in enumerate(masks):
+            line = []
+            for parts in row:
+                rgb, covered = logo_pixel(parts, colors, down=(y + 0.5) / size)
+                line.append("#%02x%02x%02x" % tuple(rgb) if covered > 0.5 else None)
+            rows.append(line)
+        _pixel_penguin.append(rows)
+    return _pixel_penguin[0]
+
+
+RETRO_SIZE = "430x330"  # retro mode's window: small, like the first version's
+RETRO_MIN = (300, 260)  # ...and it can be made nearly as small as the first one was
+RETRO_PAGE_MIN = 180    # (the room it keeps for the page, see page_min_width)
+
+
+def retro_height(height):
+    """How tall a box or button is in retro mode: about 70% of its normal height."""
+    return max(18, round(height * 0.7))
+
+
+def classic_box(canvas, x1, y1, x2, y2, face, sunken=False, tags=""):
+    """An old-style Tk box (the classic look): a face with a 3D edge, raised (light on
+    the top and left, dark on the bottom and right) or sunken (the other way round)."""
+    x2, y2 = x2 - 1, y2 - 1  # (the last pixel inside)
+    if win1_look():  # Windows 1: flat, a thin black line round it (see win1_look); a
+        # button (raised) has its corners cut, a box to type in (sunken) is square
+        line = screen_color("#000000")
+        if sunken:
+            canvas.create_rectangle(x1, y1, x2, y2, fill=face, outline=line, tags=tags)
+        else:
+            c = 2
+            canvas.create_polygon(x1 + c, y1, x2 - c, y1, x2, y1 + c, x2, y2 - c, x2 - c, y2,
+                                  x1 + c, y2, x1, y2 - c, x1, y1 + c, fill=face,
+                                  outline=line, tags=tags)
+        return
+    if win95_look():  # Windows 95: two rings of edge, in the 16 colours (see win95_look)
+        canvas.create_rectangle(x1, y1, x2, y2, fill=face, outline="", tags=tags)
+        rings = ((("#808080", "#ffffff"), ("#000000", "#c0c0c0")) if sunken
+                 else (("#ffffff", "#000000"), (None, "#808080")))
+        for i, (top_left, bottom_right) in enumerate(rings):
+            a, b, c, d = x1 + i, y1 + i, x2 - i, y2 - i
+            if top_left:
+                canvas.create_line(a, d, a, b, c, b, fill=screen_color(top_left), tags=tags)
+            canvas.create_line(a, d, c, d, c, b - 1, fill=screen_color(bottom_right),
+                               tags=tags)
+        return
+    light, dark = ("#7f7f7f", "#ffffff") if sunken else ("#ffffff", "#7f7f7f")
+    light, dark = screen_color(light), screen_color(dark)
+    canvas.create_rectangle(x1, y1, x2, y2, fill=face, outline="", tags=tags)
+    canvas.create_line(x1, y2, x1, y1, x2 + 1, y1, fill=light, tags=tags)
+    canvas.create_line(x1, y2, x2, y2, x2, y1 - 1, fill=dark, tags=tags)
+    if not sunken:  # (a raised box has a softer second shadow inside)
+        canvas.create_line(x1 + 1, y2 - 1, x2 - 1, y2 - 1, x2 - 1, y1,
+                           fill=screen_color("#a3a3a3"),
+                           tags=tags)
+
+
 def rounded_points(x1, y1, x2, y2, r):
     """Polygon points for a rounded rectangle (draw with smooth=True)."""
     return [
@@ -1328,6 +1727,8 @@ def rounded_points(x1, y1, x2, y2, r):
 
 
 def clamp_radius(r, x1, y1, x2, y2):
+    if _win11[0]:  # (Windows 11's corners are small)
+        r = min(r, 4)
     return max(0, min(r, (y2 - y1) // 2, (x2 - x1) // 2))
 
 
@@ -1387,6 +1788,7 @@ class RoundedButton(tk.Canvas):
         self.hover = False
         self.pressed = False
         self.palette = None
+        self.pill = "left"  # Win 11 mode: where a chosen menu button's accent bar goes
 
         self.bind("<Configure>", lambda e: self.redraw())
         self.bind("<Enter>", self.on_enter)
@@ -1411,6 +1813,10 @@ class RoundedButton(tk.Canvas):
     # ---- drawing ----
     def fill_color(self):
         p = self.palette
+        if win11_look() and self.flat:  # (Windows 11's menu: a faint grey under it)
+            if self.selectable and self.selected:
+                return mix_color(p["bg"], p["fg"], 0.07)
+            return mix_color(p["bg"], p["fg"], 0.045) if (self.pressed or self.hover) else p["bg"]
         if self.selectable and self.selected:
             return p["accent"] if self.accent else p["select"]
         if self.flat:  # menu button on the menu card: card colour, a gentle shade on hover
@@ -1426,12 +1832,38 @@ class RoundedButton(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 4 or h < 4:
             return
+        if classic_look():  # an old Tk button: raised, pushed in when pressed (and the
+            # chosen menu button stays pushed in)
+            sunken = self.pressed or (self.flat and self.selectable and self.selected)
+            if win1_look():  # (Windows 1: flat, so pressed or picked shows black)
+                face = self.palette["select" if sunken else "button"]
+                classic_box(self, 0, 0, w - 1, h - 1, face)
+                self.create_text(w / 2, h / 2, text=self.text, font=self.font,
+                                 fill=self.palette["select_fg" if sunken else "fg"])
+                return
+            face = (screen_color("#c3c3c3") if sunken and not win95_look()
+                    else self.palette["active" if self.hover else "button"])
+            classic_box(self, 0, 0, w, h, face, sunken)
+            self.create_text(w / 2 + sunken, h / 2 + sunken, text=self.text,
+                             fill=self.palette["fg"], font=self.font)
+            return
         x1, y1, x2, y2 = 1, 1, w - 1, h - 1
         r = clamp_radius(self.radius, x1, y1, x2, y2)
         selected = self.selectable and self.selected
+        win11_button = win11_look() and not self.flat and not (selected and self.accent)
         self.create_polygon(rounded_points(x1, y1, x2, y2, r), smooth=True,
-                            fill=self.fill_color(), outline="")
-        if selected and self.accent:
+                            fill=self.fill_color(),
+                            outline=self.palette["border"] if win11_button else "")
+        if win11_look() and self.flat and selected:  # the little accent bar
+            if self.pill == "bottom":
+                self.create_rectangle(w / 2 - 8, y2 - 3, w / 2 + 8, y2,
+                                      fill=self.palette["accent"], outline="")
+            else:
+                self.create_rectangle(x1 + 1, h / 2 - 8, x1 + 4, h / 2 + 8,
+                                      fill=self.palette["accent"], outline="")
+        if win11_look() and self.flat and selected:
+            text_color = self.palette["fg"]
+        elif selected and self.accent:
             text_color = self.palette["accent_fg"]
         elif selected:
             text_color = self.palette["select_fg"]
@@ -1515,8 +1947,11 @@ class RoundedSpin(tk.Canvas):
             self.after_cancel(self.repeat_job)
             self.repeat_job = None
 
+    def arrow_zone(self):
+        return 18 if classic_look() else self.ARROW_ZONE  # (classic: small arrow buttons)
+
     def on_press(self, event):
-        if event.x >= self.winfo_width() - self.ARROW_ZONE:
+        if event.x >= self.winfo_width() - self.arrow_zone():
             direction = 1 if event.y < self.winfo_height() / 2 else -1
             self.step(direction)
             self.stop_repeat()
@@ -1546,11 +1981,28 @@ class RoundedSpin(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 4 or h < 4:
             return
+        if classic_look():  # an old Tk spinbox: a sunken white box, with two little
+            # raised arrow buttons on the right
+            classic_box(self, 0, 0, w, h, p["field"], sunken=True, tags="shape")
+            left, mid = w - 18, h // 2
+            for top, bottom, up in ((2, mid, True), (mid, h - 2, False)):
+                classic_box(self, left, top, w - 2, bottom, p["button"], tags="shape")
+                cx, cy = left + 8, (top + bottom) / 2
+                points = ((cx - 3, cy + 1.5, cx + 3, cy + 1.5, cx, cy - 1.5) if up
+                          else (cx - 3, cy - 1.5, cx + 3, cy - 1.5, cx, cy + 1.5))
+                self.create_polygon(*points, fill=p["fg"], outline=p["fg"], tags="shape")
+            self.coords(self.entry_window, 5, h / 2)
+            self.itemconfigure(self.entry_window, width=max(10, w - 28),
+                               height=max(10, h - 6))
+            return
         x1, y1, x2, y2 = 1, 1, w - 1, h - 1
         r = clamp_radius(self.radius, x1, y1, x2, y2)
         border = p["accent"] if self.focused else p["border"]
+        if win11_look():
+            border = p["border"]  # (Win 11 shows it's in use with the line under it)
         self.create_polygon(rounded_points(x1, y1, x2, y2, r), smooth=True,
                             fill=p["field"], outline=border, width=1, tags="shape")
+        win11_underline(self, x1, x2, y2, r, self.focused, p)
 
         # arrows
         cx, cy = w - 15, h / 2
@@ -1611,10 +2063,16 @@ class RoundedEntry(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 4 or h < 4:
             return
-        x1, y1, x2, y2 = 1, 1, w - 1, h - 1
-        r = clamp_radius(self.radius, x1, y1, x2, y2)
-        self.create_polygon(rounded_points(x1, y1, x2, y2, r), smooth=True, fill=p["field"],
-                            outline=p["accent"] if self.focused else p["border"], tags="shape")
+        if classic_look():  # an old Tk entry: a sunken white box
+            classic_box(self, 0, 0, w, h, p["field"], sunken=True, tags="shape")
+        else:
+            x1, y1, x2, y2 = 1, 1, w - 1, h - 1
+            r = clamp_radius(self.radius, x1, y1, x2, y2)
+            self.create_polygon(rounded_points(x1, y1, x2, y2, r), smooth=True,
+                                fill=p["field"], tags="shape",
+                                outline=p["accent"] if self.focused and not win11_look()
+                                else p["border"])
+            win11_underline(self, x1, x2, y2, r, self.focused, p)
         self.tag_lower("shape")
         self.coords(self.entry_window, 10, h / 2)
         self.itemconfigure(self.entry_window, width=max(10, w - 20), height=max(10, h - 10))
@@ -1691,11 +2149,26 @@ class RoundedCombo(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 4 or h < 4:
             return
+        if classic_look():  # an old Tk option menu: a raised button with a little
+            # raised box on the right
+            classic_box(self, 0, 0, w, h, p["active" if self.hover else "button"])
+            text, color = self.var.get(), p["fg"]
+            if not text:
+                text, color = self.placeholder, p["muted"]
+            self.create_text(7, h / 2, text=text, anchor="w", fill=color, font="TkTextFont")
+            bx, by = w - 20, h / 2 - 5
+            classic_box(self, bx, by, bx + 13, by + 10, p["button"], sunken=bool(self.popup))
+            self.create_polygon(bx + 3.5, by + 3.5, bx + 9.5, by + 3.5, bx + 6.5, by + 6.5,
+                                fill=p["fg"], outline=p["fg"])
+            return
         x1, y1, x2, y2 = 1, 1, w - 1, h - 1
         r = clamp_radius(self.radius, x1, y1, x2, y2)
         border = p["accent"] if (self.hover or self.popup) else p["border"]
+        if win11_look():
+            border = p["border"]
         self.create_polygon(rounded_points(x1, y1, x2, y2, r), smooth=True,
                             fill=p["field"], outline=border, width=1)
+        win11_underline(self, x1, x2, y2, r, self.hover or self.popup, p)
         text, color = self.var.get(), p["fg"]
         if not text:
             text, color = self.placeholder, p["muted"]
@@ -1796,7 +2269,7 @@ class DropdownPopup(tk.Toplevel):
         try:
             self.wait_visibility()
             self.update_idletasks()
-            round_window(self, FIELD_RADIUS, self.w, self.h)
+            round_window(self, None if classic_look() else FIELD_RADIUS, self.w, self.h)
             self.set_alpha(1.0)
             try:
                 self.grab_set_global()  # so a click anywhere (even outside the app) closes it
@@ -1822,7 +2295,11 @@ class DropdownPopup(tk.Toplevel):
         top = max(0, min(self.top + step, len(self.values) - self.visible))
         if top != self.top:
             self.top = top
-            if self.glide_job is None:
+            if classic_look():  # (retro: straight there, no gliding)
+                self.pos = float(top)
+                self.hover = self.index_at(self.winfo_pointery() - self.winfo_rooty())
+                self.redraw()
+            elif self.glide_job is None:
                 self.glide()
 
     def glide(self):
@@ -1907,6 +2384,9 @@ class DropdownPopup(tk.Toplevel):
         c.delete("all")
         current = self.combo.var.get()
         right = self.w - self.PAD - (self.BAR_ROOM if self.scrolls else 0)
+        if classic_look():
+            self.redraw_classic(c, p, current, right)
+            return
         first = math.floor(self.pos)
         for i in range(first, min(len(self.values), first + self.visible + 1)):
             value = self.values[i]
@@ -1936,6 +2416,35 @@ class DropdownPopup(tk.Toplevel):
             c.create_line(x, top + r, x, bottom - r, width=self.BAR_W, capstyle="round",
                           fill=(mix_color(p["muted"], p["fg"], 0.35) if self.drag_from
                                 else mix_color(p["border"], p["muted"], 0.6)))
+
+    def redraw_classic(self, c, p, current, right):
+        """The classic look: an old Tk menu, grey with a raised edge, the item under the
+        mouse raised and lighter, and a plain scroll bar."""
+        c.create_rectangle(0, 0, self.w, self.h, fill=p["button"], outline="")
+        first = math.floor(self.pos)
+        for i in range(first, min(len(self.values), first + self.visible + 1)):
+            value = self.values[i]
+            y1 = self.PAD + (i - self.pos) * self.ITEM_H
+            words = p["fg"]
+            if i == self.hover and old_windows_look():  # (old Windows: navy or black)
+                c.create_rectangle(3, y1 + 1, right + 2, y1 + self.ITEM_H - 1,
+                                   fill=p["select"], outline="")
+                words = p["select_fg"]
+            elif i == self.hover:
+                classic_box(c, 3, y1 + 1, right + 2, y1 + self.ITEM_H - 1, p["active"])
+            c.create_text(12, y1 + self.ITEM_H / 2, text=value, anchor="w", fill=words,
+                          font="TkTextFont")
+            if value == current:  # a mark next to the chosen item
+                cx, cy = right - 10, y1 + self.ITEM_H / 2
+                c.create_line(cx - 4, cy, cx - 1, cy + 3, cx + 5, cy - 4, fill=words,
+                              width=2)
+        for y1, y2 in ((0, self.PAD), (self.h - self.PAD, self.h)):
+            c.create_rectangle(0, y1, self.w, y2, fill=p["button"], outline="")
+        bar = self.bar()
+        if bar:
+            x, top, bottom = bar
+            classic_box(c, x - 3, top, x + 4, bottom, p["button"])
+        classic_box(c, 0, 0, self.w, self.h, "")  # (just the raised edge)
 
     def close(self):
         if self.closed:
@@ -1991,13 +2500,14 @@ def render_switch(image, w, h, pad, pos, track_color, bg_color):
     """Draw a switch (pill-shaped track + round knob) into a PhotoImage with smooth edges."""
     bg = [int(bg_color[i:i + 2], 16) for i in (1, 3, 5)]
     tc = [int(track_color[i:i + 2], 16) for i in (1, 3, 5)]
+    white = screen_rgb((255, 255, 255))  # (the knob: white, unless there's a filter on)
     pixels = []
     for track, shadow, knob in switch_masks(w, h, pad, pos):
         color = []
-        for b, t in zip(bg, tc):
+        for b, t, k in zip(bg, tc, white):
             c = b + (t - b) * track       # track over background
             c -= c * shadow               # darken a little for the shadow
-            c += (255 - c) * knob         # white knob on top
+            c += (k - c) * knob           # white knob on top
             color.append(round(c))
         pixels.append("#%02x%02x%02x" % tuple(color))
     image.put(" ".join("{" + " ".join(pixels[y * w:(y + 1) * w]) + "}" for y in range(h)))
@@ -2293,6 +2803,9 @@ class Logo(tk.Canvas):
         self.shown = None     # (size, masks, pointer) of the picture drawn now
         self.job = None       # waiting for the size to stay put
         self.working = None   # [size, result or None] while a thread works out shapes
+        self.text_only = False  # the classic look: just "Auto Clicker", no penguin
+        self.title_bar = False  # Win 95 mode: a navy title bar (see set_text_only)
+        self.pixel_image = None
         self.image = tk.PhotoImage(width=1, height=1)
         self.bind("<Configure>", lambda e: self.place())  # (just moves things: quick)
         self.set_size(self.ICON)
@@ -2357,8 +2870,28 @@ class Logo(tk.Canvas):
         elif self.job is None:
             self.job = self.after(self.WAIT_MS, self.work_out)
 
+    def set_text_only(self, on, title_bar=False):
+        """The classic look: just the words "Auto Clicker", in bold on two lines, like the
+        very first version (or back to the penguin). title_bar: Win 95 mode's look instead,
+        a navy title bar with a little pixel penguin and the name."""
+        self.text_only = on
+        self.title_bar = on and title_bar
+        if self.title_bar:
+            f = tkfont.Font(font=self.font)
+            self.configure(height=max(18, f.metrics("linespace") + 6),
+                           width=3 + 16 + 4 + f.measure(self.NAME) + 8)
+        elif on:
+            f = tkfont.Font(font=self.font)
+            self.configure(height=f.metrics("linespace") * 2,
+                           width=max(f.measure("Auto"), f.measure("Clicker")) + 4)
+        else:
+            self.icon, self.points = 0, None  # (so set_size sizes it again)
+        self.place()
+
     def take_size(self):
         icon, points = self.wanted
+        if self.text_only:
+            return  # (the classic look keeps its words; the size is taken when it ends)
         if points is not None and int(self.font.cget("size")) != points:
             self.font.configure(size=points)
         f = tkfont.Font(font=self.font)
@@ -2381,6 +2914,11 @@ class Logo(tk.Canvas):
 
     def redraw(self):
         """Paint the picture in the current colours (slow-ish), then place it."""
+        if self.text_only:
+            if self.title_bar and self.palette:
+                self.paint_pixel_penguin()
+            self.place()
+            return
         if not self.palette or self.shown is None:
             return
         size, masks, pointer = self.shown
@@ -2391,11 +2929,13 @@ class Logo(tk.Canvas):
         def rgb(color):
             return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
         solid, gradients = {}, {}
-        for name, color in logo_colors(p["accent"]).items():
+        # (p["accent"] has been through any Super Secret Settings filter already, so the
+        # logo's colours come from the accent before it was: see accent_before_filter)
+        for name, color in logo_colors(p.get("accent_before_filter", p["accent"])).items():
             if isinstance(color, tuple):
-                gradients[name] = (rgb(color[0]), rgb(color[1]))
+                gradients[name] = (screen_rgb(rgb(color[0])), screen_rgb(rgb(color[1])))
             else:
-                solid[name] = rgb(color)
+                solid[name] = screen_rgb(rgb(color))
         rows = []
         for y, row in enumerate(masks):
             down = (y + 0.5) / size
@@ -2413,15 +2953,43 @@ class Logo(tk.Canvas):
                 color = (round(r + bg[0] * rest), round(g + bg[1] * rest),
                          round(b + bg[2] * rest))
                 if (x, y) in pointer:
-                    color = over(pointer[x, y], color, 1.0)[0]
+                    top, alpha = pointer[x, y]
+                    color = over((screen_rgb(top), alpha), color, 1.0)[0]
                 pixels.append("#%02x%02x%02x" % color)
             rows.append("{" + " ".join(pixels) + "}")
         self.image.put(" ".join(rows))
         self.place()
 
+    def paint_pixel_penguin(self):
+        """Win 95 mode's 16x16 penguin (see pixel_penguin), through any filter."""
+        if self.pixel_image is None:
+            self.pixel_image = tk.PhotoImage(width=16, height=16)
+        rows = pixel_penguin()
+        self.pixel_image.put(" ".join(
+            "{" + " ".join(screen_color(c or "#000000") for c in row) + "}" for row in rows))
+        for y, row in enumerate(rows):
+            for x, c in enumerate(row):
+                if c is None:
+                    self.pixel_image.transparency_set(x, y, True)
+
     def place(self):
         """Put the picture and the name in their places (after a resize: quick)."""
         self.delete("all")
+        if self.title_bar and self.palette:  # Win 95 mode: a title bar
+            w, h = self.winfo_width(), self.winfo_height()
+            self.create_rectangle(0, 0, w, h, fill=self.palette["accent"], outline="")
+            if self.pixel_image is not None:
+                self.create_image(3, h // 2, image=self.pixel_image, anchor="w")
+            self.create_text(3 + 16 + 4, h // 2, text=self.NAME, anchor="w",
+                             fill=self.palette["accent_fg"], font=self.font)
+            return
+        if self.text_only and self.palette:
+            h = self.winfo_height()
+            self.create_text(0, h / 2, text="Auto", anchor="sw", fill=self.palette["fg"],
+                             font=self.font)
+            self.create_text(0, h / 2, text="Clicker", anchor="nw", fill=self.palette["fg"],
+                             font=self.font)
+            return
         if not self.palette or self.shown is None:
             return
         h = self.winfo_height()
@@ -2581,7 +3149,10 @@ class ToggleSwitch(tk.Canvas):
     def set_text(self, text):
         if text != self.text:
             self.text = text
-            self.configure(width=self.width_for(text, self.font))
+            self.base_width = self.width_for(text, self.font)
+            # (retro mode's tick box is narrower than the switch)
+            self.configure(width=self.base_width - (self.TRACK_W - 13) if classic_look()
+                           else self.base_width)
             self.redraw()
 
     def on_enter(self, _event):
@@ -2628,6 +3199,27 @@ class ToggleSwitch(tk.Canvas):
         if w < 4 or h < 4:
             return
 
+        if classic_look():  # an old Tk checkbutton: a little sunken white box with a tick
+            size = 13
+            x = 1 if self.text else w - 2 - size  # (with words: the box first, like Tk)
+            y = (h - size) // 2
+            classic_box(self, x, y, x + size, y + size, p["field"], sunken=True)
+            if self.pos > 0.5 and win1_look():  # (Windows 1 crossed its boxes)
+                self.create_line(x + 1, y + 1, x + size, y + size, fill=p["fg"])
+                self.create_line(x + size - 1, y + 1, x, y + size, fill=p["fg"])
+            elif self.pos > 0.5 and win95_look():  # (drawn pixel by pixel)
+                for row, line in enumerate(WIN95_TICK):
+                    for col, pixel in enumerate(line):
+                        if pixel == "#":
+                            self.create_rectangle(x + 3 + col, y + 3 + row, x + 4 + col,
+                                                  y + 4 + row, fill=p["fg"], outline="")
+            elif self.pos > 0.5:
+                self.create_line(x + 3, y + 6, x + 5, y + 9, x + 10, y + 3, fill=p["fg"],
+                                 width=2)
+            if self.text:
+                self.create_text(x + size + 6, h / 2, text=self.text, anchor="w",
+                                 fill=p["fg"], font=self.font)
+            return
         self.create_text(1, h / 2, text=self.text, anchor="w", fill=p["fg"], font=self.font)
 
         # The switch itself is drawn pixel by pixel into an image with smooth
@@ -2637,14 +3229,26 @@ class ToggleSwitch(tk.Canvas):
             track = mix_color(track, p["fg"], 0.12)
         if self.image is None:
             self.image = tk.PhotoImage(width=self.TRACK_W, height=self.TRACK_H)
-        look = (round(self.pos, 3), track, p["bg"])
+        look = (round(self.pos, 3), track, p["bg"], win11_look(), p["fg"], self.hover)
         if look != getattr(self, "drawn", None):  # only redo the pixels if it looks different
             self.drawn = look
-            render_switch(self.image, self.TRACK_W, self.TRACK_H, self.KNOB_PAD,
-                          self.pos, track, p["bg"])
+            if win11_look():
+                render_switch_win11(self.image, self.TRACK_W, self.TRACK_H, self.pos, p,
+                                    self.hover)
+            else:
+                render_switch(self.image, self.TRACK_W, self.TRACK_H, self.KNOB_PAD,
+                              self.pos, track, p["bg"])
         self.create_image(w - 2 - self.TRACK_W, (h - self.TRACK_H) // 2,
                           image=self.image, anchor="nw")
 
+
+WIN95_TICK = ("......#",  # Win 95 mode's tick, see ToggleSwitch
+              ".....##",
+              "#...###",
+              "##.###.",
+              "#####..",
+              ".###...",
+              "..#....")
 
 _swatch_mask_cache = {}
 
@@ -3103,11 +3707,19 @@ class KeyChooser(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 4 or h < 4:
             return
-        x1, y1, x2, y2 = 1, 1, w - 1, h - 1
-        r = clamp_radius(self.radius, x1, y1, x2, y2)
-        border = p["accent"] if (self.listening or self.hover) else p["border"]
-        self.create_polygon(rounded_points(x1, y1, x2, y2, r), smooth=True,
-                            fill=p["field"], outline=border, width=2 if self.listening else 1)
+        if classic_look():  # an old Tk button, pushed in while it waits for a key
+            classic_box(self, 0, 0, w, h, "#c3c3c3" if self.listening
+                        else p["active" if self.hover else "button"], sunken=self.listening)
+        else:
+            x1, y1, x2, y2 = 1, 1, w - 1, h - 1
+            r = clamp_radius(self.radius, x1, y1, x2, y2)
+            border = p["accent"] if (self.listening or self.hover) else p["border"]
+            if win11_look():
+                border = p["border"]
+            self.create_polygon(rounded_points(x1, y1, x2, y2, r), smooth=True,
+                                fill=p["field"], outline=border,
+                                width=1 if win11_look() else 2 if self.listening else 1)
+            win11_underline(self, x1, x2, y2, r, self.listening or self.hover, p)
         if self.listening and self.message:
             text, color = self.message, p["accent"]
         elif self.listening:
@@ -3186,6 +3798,15 @@ class ClickBadge(tk.Canvas):
                                       font=font if len(text) <= 3 else small_font)
 
     def set_palette(self, palette):
+        self.delete("classic")
+        if classic_look():  # a plain raised box with the label, no circle
+            self.configure(bg=palette["bg"])
+            self.itemconfigure(self.picture, image="")
+            classic_box(self, 1, 3, self.SIZE - 1, self.SIZE - 3, palette["button"],
+                        tags="classic")
+            self.tag_raise(self.label)
+            self.itemconfigure(self.label, fill=palette["fg"])
+            return
         key = (palette["accent"], palette["bg"])
         image = self._images.get(key)
         if image is None:
@@ -3353,7 +3974,17 @@ def set_title_bar(window, show):
     try:
         # Tk puts each top-level window inside a "wrapper" window: that's the one the
         # window manager looks after, so the hint goes on it
-        wrapper = d.create_resource_object("window", window.winfo_id()).query_tree().parent
+        # (it's the first window up from this one with a window class: usually its parent,
+        # but at first there can be another window between them)
+        wrapper, screen = d.create_resource_object("window", window.winfo_id()), d.screen().root
+        for _ in range(4):
+            wrapper = wrapper.query_tree().parent
+            if wrapper.id == screen.id:
+                return False  # (not on screen yet)
+            if wrapper.get_wm_class() is not None:
+                break
+        else:
+            return False
         hints = d.intern_atom("_MOTIF_WM_HINTS")
         if show:
             wrapper.delete_property(hints)
@@ -4191,6 +4822,146 @@ class ShapeDrawer(ScreenLayer):
         self.add(shape)
 
 
+class TriggerBoxDrawer(ScreenLayer):
+    """The colour trigger's menu, like the Areas one: a see-through layer over the whole
+    screen (see ScreenLayer) with a menu at the top. Box: drag a box round the part of
+    the screen to watch (or click for a single spot); drawing another replaces it.
+    Colour: click anything to watch for its colour. Done (or Esc) finishes.
+    on_done(box, colour) gets them: [x1, y1, x2, y2] or None, and "#rrggbb" or ""."""
+
+    OLD = "#b0b0b0"  # the box from before
+    NEW = "#ffffff"   # the box being drawn, or drawn this time
+
+    def __init__(self, root, box, colour, on_done, accent="#4a8fd9", mode="box"):
+        super().__init__(root, accent)
+        self.box, self.colour, self.on_done = box, colour, on_done
+        self.mode = mode
+        self.changed = False  # a box was drawn this time (it's white, not grey)
+        self.start = None
+        self.redraw_box()
+        self.draw_bar()
+        self.bind_mouse(ButtonPress_1=self.press, B1_Motion=self.drag,
+                        ButtonRelease_1=self.release)
+        self.bind("<Escape>", lambda e: self.finish())
+        self.bind("<Return>", lambda e: self.finish())
+        self.bind("<ButtonRelease-3>", lambda e: self.finish())
+        self.show_now()
+
+    def draw_bar(self):
+        if self.mode == "box":
+            hint = "Drag a box round the part of the screen to watch (or click one spot)"
+        else:
+            hint = "Click the colour to watch for"
+        hint += f"  \u00b7  colour {self.colour}" if self.colour else "  \u00b7  no colour yet"
+        hint += "  \u00b7  Done or Esc to finish"
+        self.draw_menu(["box", "colour", "done"], {"box": "Box", "colour": "Colour",
+                                                   "done": "Done"}, hint, chosen=self.mode)
+
+    def bar_pressed(self, name):
+        if name == "done":
+            self.finish()
+        else:
+            self.mode = name
+            self.draw_bar()
+
+    def redraw_box(self, box=None):
+        """The box (or `box`, while one's being drawn), with its size and the colour under
+        it."""
+        c = self.canvas
+        c.delete("box")
+        box = box or self.box
+        self.regions["box"] = []
+        if not box:
+            self.show_regions()
+            return
+        x1, y1, x2, y2 = box
+        shape = {"type": "rectangle", "points": [x1, y1, x2 - 1, y2 - 1]}
+        color = self.NEW if (self.changed or box is not self.box) else self.OLD
+        draw_shape(c, shape, self.EDGE, width=5, tags="box")
+        draw_shape(c, shape, color, width=2, tags="box")
+        label_y = y2 + 22 if y2 + 44 < self.height else y1 - 22
+        text = c.create_text((x1 + x2) / 2, label_y, fill="#ffffff",
+                             text=f"{x2 - x1} \u00d7 {y2 - y1}",
+                             font=("TkDefaultFont", 12, "bold"), tags="box")
+        tx1, ty1, tx2, ty2 = c.bbox(text)
+        right = tx2
+        if self.colour:  # a little square of the colour it watches for
+            c.create_rectangle(tx2 + 8, ty1 + 1, tx2 + 8 + (ty2 - ty1) - 2, ty2 - 1,
+                               fill=self.colour, outline="#ffffff", tags="box")
+            right = tx2 + 8 + (ty2 - ty1) - 2
+        c.create_rectangle(tx1 - 6, ty1 - 3, right + 6, ty2 + 3, fill=self.PANEL,
+                           outline="", tags="box")
+        c.tag_raise(text)
+        self.regions["box"] = outline_rects(shape) + [(tx1 - 6, ty1 - 3, right - tx1 + 13,
+                                                       ty2 - ty1 + 7)]
+        # (the square of colour goes above the label's panel)
+        for item in c.find_withtag("box"):
+            if c.type(item) == "rectangle" and c.itemcget(item, "fill") == self.colour:
+                c.tag_raise(item)
+        c.tag_raise("bar")
+        self.show_regions()
+
+    # ---- the mouse ----
+    def press(self, event):
+        self.bar_down = self.on_bar(event)
+        self.start = None if self.bar_down else (event.x_root, event.y_root)
+
+    def drag(self, event):
+        if self.start is not None and self.mode == "box":
+            self.redraw_box(self.box_from(event))
+
+    def release(self, event):
+        down, self.bar_down = self.bar_down, None
+        if down or self.on_bar(event):
+            if down and down == self.on_bar(event):
+                self.bar_pressed(down)
+            return
+        if self.start is None:
+            return
+        if self.mode == "colour":
+            self.start = None
+            self.pick_colour(event.x_root, event.y_root)
+            return
+        self.box = self.box_from(event)
+        self.start = None
+        self.changed = True
+        self.redraw_box()
+        if not self.colour:  # (straight on to the colour)
+            self.mode = "colour"
+        self.draw_bar()
+
+    def box_from(self, event):
+        (x1, y1), x2, y2 = self.start, event.x_root, event.y_root
+        return [min(x1, x2), min(y1, y2), max(x1, x2) + 1, max(y1, y2) + 1]
+
+    def pick_colour(self, x, y):
+        """Take the colour of the pixel at x, y. This layer goes completely see-through for
+        a moment first, so it's the colour of what's under it."""
+        try:
+            self.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+        self.set_alpha(0.0)
+        self.after(90, lambda: self.read_colour(x, y))
+
+    def read_colour(self, x, y):
+        data = grab_screen(x, y, 1, 1)
+        try:
+            self.attributes("-alpha", 0.01)
+        except tk.TclError:
+            return  # (closed meanwhile)
+        self.set_alpha(1.0 if self.cutter is not None and self.cutter.ok else 0.45)
+        if data:
+            self.colour = "#%02x%02x%02x" % (data[2], data[1], data[0])
+            self.redraw_box()
+            self.draw_bar()
+
+    def finish(self):
+        box, colour = self.box, self.colour
+        self.close()
+        self.on_done(box, colour)
+
+
 class MacroRecorder(ScreenLayer):
     """The Macros menu: a see-through layer over the whole screen (see ScreenLayer) for
     choosing where a macro clicks. Click anywhere with the left, right or middle button to
@@ -4682,6 +5453,22 @@ class RoundedScrollbar(tk.Canvas):
         if not self.palette or self.winfo_height() < 2 * self.MIN_LENGTH:
             return
         p = self.palette
+        if classic_look():  # an old Tk scroll bar: a sunken trough with a raised slider
+            w, h = self.winfo_width(), self.winfo_height()
+            if win1_look():  # Windows 1: a dotted grey trough in a black line
+                self.create_rectangle(0, 0, w - 1, h - 1, fill=p["bg"],
+                                      outline=screen_color("#000000"))
+                self.create_rectangle(1, 1, w - 1, h - 1, fill=screen_color("#000000"),
+                                      outline="", stipple="gray25")
+            elif win95_look():  # Windows 95's dotted trough: white and grey pixels in turn
+                self.create_rectangle(0, 0, w, h, fill=p["bg"], outline="")
+                self.create_rectangle(0, 0, w, h, fill=screen_color("#ffffff"), outline="",
+                                      stipple="gray50")
+            else:
+                classic_box(self, 0, 0, w, h, "#c3c3c3", sunken=True)
+            top, bottom = round(self.handle()[0]), round(self.handle()[1])
+            classic_box(self, 1, top, w - 1, bottom, p["active" if self.hover else "button"])
+            return
         active = self.hover or self.drag_offset is not None
         width = self.WIDE if active else self.THIN
         # easy to spot on both light and dark pages, and a bit stronger under the mouse
@@ -4796,6 +5583,9 @@ class ScrollArea(ttk.Frame):
         now = self.canvas.yview()[0] * height
         start = self.glide_target if self.glide_job is not None else now
         self.glide_target = min(max(start + pixels, 0), most)
+        if classic_look():  # retro: straight there, no gliding (like old Tk)
+            self.canvas.yview_moveto(self.glide_target / max(1, height))
+            return
         if self.glide_job is None:
             self.glide_step()
 
@@ -4839,6 +5629,7 @@ class SidebarHandle(tk.Canvas):
         self.hover = False
         self.dragging = False
         self.glow = 0.0       # 0: grey, 1: accent colour (see fade_to)
+        self.plain = False    # the classic look: a plain line, no colour
         self.glow_job = None
         self.vertical = True  # False when the menu is along the top or bottom
         self.bind("<Configure>", lambda e: self.redraw())
@@ -4864,7 +5655,7 @@ class SidebarHandle(tk.Canvas):
         if self.glow_job is not None:
             self.after_cancel(self.glow_job)
             self.glow_job = None
-        if hover:  # still here after a moment: light up
+        if hover and not self.plain:  # still here after a moment: light up
             self.glow_job = self.after(self.HOVER_WAIT, lambda: self.fade_to(1.0))
         else:
             self.fade_to(0.0)
@@ -4912,8 +5703,9 @@ class SidebarHandle(tk.Canvas):
                 self.create_rectangle(0, mid - before, w, mid + after, fill=color, outline="")
 
         if self.dragging:
-            line(1, 2, self.palette["accent"])
-        elif self.glow > 0:  # the mouse stayed on it: it fades into the accent colour
+            line(1, 1 if self.plain else 2,
+                 self.palette["muted" if self.plain else "accent"])
+        elif self.glow > 0 and not self.plain:  # the mouse stayed on it: it fades into the accent colour
             # (see set_hover), and gets thicker as it does
             color = mix_color(self.palette["border"], self.palette["accent"], self.glow)
             line(1 if self.glow > 0.3 else 0, 2 if self.glow > 0.6 else 1, color)
@@ -5094,6 +5886,590 @@ class RawMotion:
             self.on_move(dx, dy)
 
 
+WIN95_CLOSE = ("##....##",  # the pixels of Win 95 mode's title bar buttons' marks
+               ".##..##.",
+               "..####..",
+               "...##...",
+               "..####..",
+               ".##..##.",
+               "##....##")
+
+
+class Win95TitleBar(tk.Canvas):
+    """Win 95 and Win 1 mode's own window frame (the computer's title bar is hidden
+    meanwhile). Win 95: a navy title bar with the pixel penguin, the name and the minimise /
+    maximise / close buttons, and a grey 3D border round the window. Win 1: see redraw_win1. Like Windows 95, dragging the title
+    bar (or the border, to resize) only moves a dotted outline; the window jumps there
+    when you let go."""
+
+    HEIGHT = 18
+    BORDER = 4          # the border round the window (it's the window's own padding)
+    BUTTON = (16, 14)   # a title bar button's size
+    CORNER = 16         # how far along an edge counts as its corner, for resizing
+    LINE = 3            # how thick the dragging outline is
+    CURSORS = {"n": "top_side", "s": "bottom_side", "w": "left_side", "e": "right_side",
+               "nw": "top_left_corner", "ne": "top_right_corner",
+               "sw": "bottom_left_corner", "se": "bottom_right_corner"}
+
+    def __init__(self, root, on_close):
+        super().__init__(root, height=self.HEIGHT, highlightthickness=0, bd=0)
+        self.root = root
+        self.on_close = on_close
+        self.palette = None
+        self.shown = False
+        self.active = True       # the window has the keyboard (else the bar is grey)
+        self.pressed = None      # the button being pressed: "min", "max" or "close"
+        self.drag = None         # while dragging: (edges, pointer x, y, window x, y, w, h)
+        self.outline = []        # the 4 strips of the dragging outline (made when needed)
+        self.edge_cursor = None  # the window's cursor is a resizing one (over the border)
+        self.icon = tk.PhotoImage(width=16, height=16)
+        self.icon11 = None       # Win 11 mode's icon: the normal penguin (made when needed)
+        self.hovered = None      # Win 11 mode: the button under the mouse
+        self.rounded = False     # Win 11 mode: the window's corners are cut round
+        self.round_job = None
+        self.move_job = None     # Win 11 mode: moving the window (it moves as you drag)
+        # the border's edges: (Win 95 colour, Win 1 colour, where) for place, see show
+        # ("where" for a border b pixels wide). Win 95: a 3D edge. Win 1: a thin black
+        # line all the way round. Win 11: a thin line in its border colour (the first 4).
+        self.lines = [(tk.Frame(root, bd=0, highlightthickness=0), (color95, color1), where)
+                      for color95, color1, where in (
+            ("#000000", "#000000", lambda b: dict(x=-b, rely=1, y=b - 1, relwidth=1,
+                                                  width=2 * b, height=1)),
+            ("#000000", "#000000", lambda b: dict(relx=1, x=b - 1, y=-b, relheight=1,
+                                                  height=2 * b, width=1)),
+            ("#c0c0c0", "#000000", lambda b: dict(x=-b, y=-b, relwidth=1, width=2 * b,
+                                                  height=1)),
+            ("#c0c0c0", "#000000", lambda b: dict(x=-b, y=-b, relheight=1, height=2 * b,
+                                                  width=1)),
+            ("#ffffff", "#ffffff", lambda b: dict(x=1 - b, y=1 - b, relwidth=1,
+                                                  width=2 * b - 3, height=1)),
+            ("#ffffff", "#ffffff", lambda b: dict(x=1 - b, y=1 - b, relheight=1,
+                                                  height=2 * b - 3, width=1)),
+            ("#808080", "#ffffff", lambda b: dict(x=1 - b, rely=1, y=b - 2, relwidth=1,
+                                                  width=2 * b - 2, height=1)),
+            ("#808080", "#ffffff", lambda b: dict(relx=1, x=b - 2, y=1 - b, relheight=1,
+                                                  height=2 * b - 2, width=1)))]
+        self.bind("<Configure>", lambda e: self.redraw())
+        self.bind("<ButtonPress-1>", self.on_press)
+        self.bind("<B1-Motion>", self.on_motion)
+        self.bind("<ButtonRelease-1>", self.on_release)
+        self.bind("<Double-Button-1>", self.on_double)
+        self.bind("<Motion>", self.on_hover)
+        self.bind("<Leave>", lambda e: self.set_hovered(None))
+        root.bind("<Configure>", self.on_root_configure, add="+")
+        root.bind("<Motion>", self.on_root_motion, add="+")
+        root.bind("<ButtonPress-1>", self.on_root_press, add="+")
+        root.bind("<B1-Motion>", self.on_root_drag, add="+")
+        root.bind("<ButtonRelease-1>", self.on_root_release, add="+")
+        root.bind("<FocusIn>", lambda e: self.after_idle(self.check_active), add="+")
+        root.bind("<FocusOut>", lambda e: self.after(50, self.check_active), add="+")
+        # (the border's lines get these too: everything in the window does)
+
+    # ---- showing ----
+    def show(self, on):
+        """Use this frame instead of the computer's title bar (or go back to that one)."""
+        if on == self.shown:
+            return
+        self.shown = on
+        root = self.root
+        if on:
+            self.drop_title_bar()
+            self.place_parts()
+        else:
+            self.remove_parts()
+            if root.winfo_ismapped():  # (the title bar only comes back once it's shown again)
+                x, y = root.winfo_rootx(), root.winfo_rooty()
+                set_title_bar(root, True)
+                root.withdraw()
+                root.deiconify()
+                root.after(40, lambda: root.geometry(f"+{x}+{y}"))  # (where it was)
+            else:
+                set_title_bar(root, True)
+
+    def drop_title_bar(self, tries=0):
+        """Hide the computer's title bar, once the window is on screen (before that, Tk
+        hasn't made the window the window manager looks after), then check it went."""
+        root = self.root
+        if not self.shown:
+            return
+        if not root.winfo_ismapped():  # (the app is starting: try again in a moment)
+            if tries < 250:
+                root.after(20, lambda: self.drop_title_bar(tries + 1))
+            return
+        set_title_bar(root, False)
+        root.after(300, self.check_title_bar)
+
+    def title_bar_showing(self):
+        """True if the computer's title bar is still there: then the window's contents
+        start lower down than the window itself (by the title bar's height)."""
+        root = self.root
+        try:
+            top = int(root.geometry().split("+")[2])
+        except (IndexError, ValueError):
+            return False
+        return root.winfo_rooty() - top > 4
+
+    def check_title_bar(self, tries=0):
+        """The window manager can miss the hint while it's still putting the window on
+        screen (when the app starts). If it did, hide and show the window again: it
+        always reads the hint when a window appears."""
+        root = self.root
+        if not self.shown or not root.winfo_ismapped() or not self.title_bar_showing():
+            return
+        if tries >= 2:
+            return  # (it's not going: leave it be)
+        place = root.geometry()
+        set_title_bar(root, False)
+        root.withdraw()
+        root.deiconify()
+        root.after(60, lambda: (root.geometry(place),
+                                root.after(300, lambda: self.check_title_bar(tries + 1))))
+
+    def place_parts(self):
+        """The border and title bar (the window's contents are put below the bar, see
+        AutoClicker.layout_sidebar)."""
+        b = self.border()
+        self.root.configure(padx=b, pady=b)
+        self.configure(height=self.bar_height())
+        self.grid(row=0, column=0, columnspan=3, sticky="ew",
+                  pady=(0, 0 if win11_look() else 2))
+        for i, (line, _color, where) in enumerate(self.lines):
+            if win11_look() and i >= 4:  # (Win 11: just the outer line)
+                line.place_forget()
+            else:
+                line.place(**where(b))
+
+    def border(self):
+        """How wide the border is: Win 11's is a thin line (you can still resize from a
+        little way in, see edges_at), the old ones are thicker."""
+        return 1 if win11_look() else self.BORDER
+
+    def remove_parts(self):
+        """No border or title bar (mini mode, or Win 95 mode is off)."""
+        self.root.configure(padx=0, pady=0, cursor="")
+        self.edge_cursor = None
+        self.grid_remove()
+        self.unround()
+        for line, _color, _where in self.lines:
+            line.place_forget()
+
+    # ---- drawing ----
+    def set_palette(self, palette):
+        self.palette = palette
+        self.configure(bg=palette["bg"])
+        for i, (line, colors, _where) in enumerate(self.lines):
+            if win11_look():  # (a thin line round the window, in its border colour)
+                line.configure(bg=palette["border"] if i < 4 else palette["bg"])
+            else:
+                line.configure(bg=screen_color(colors[1] if win1_look() else colors[0]))
+        if win11_look():
+            self.configure(height=self.bar_height())
+            self.round_soon()
+        else:
+            self.unround()
+        rows = pixel_penguin()
+        self.icon.put(" ".join(
+            "{" + " ".join(screen_color(c or "#000000") for c in row) + "}" for row in rows))
+        for y, row in enumerate(rows):
+            for x, c in enumerate(row):
+                if c is None:
+                    self.icon.transparency_set(x, y, True)
+        self.redraw()
+
+    def check_active(self):
+        """Windows 95 greyed out the title bar of a window that didn't have the keyboard."""
+        try:
+            active = self.root.focus_get() is not None
+        except (KeyError, tk.TclError):  # (a dropdown list of ours has it)
+            active = True
+        if active != self.active:
+            self.active = active
+            self.redraw()
+
+    def zoomed(self):
+        try:
+            return bool(int(self.root.wm_attributes("-zoomed")))
+        except (tk.TclError, ValueError):
+            return False
+
+    def bar_height(self):
+        return 32 if win11_look() else self.HEIGHT
+
+    # ---- Win 11: round corners, buttons that light up, moving as you drag ----
+    def on_root_configure(self, event):
+        if event.widget is self.root and self.rounded is not None:
+            self.round_soon()
+
+    def round_soon(self):
+        if not (self.shown and win11_look()):
+            return
+        if self.round_job is not None:
+            self.after_cancel(self.round_job)
+        self.round_job = self.after(60, self.round_now)
+
+    def round_now(self):
+        """Windows 11's windows have round corners (not when maximised)."""
+        self.round_job = None
+        if not (self.shown and win11_look()):
+            return
+        root = self.root
+        round_window(root, None if self.zoomed() else 8, root.winfo_width(),
+                     root.winfo_height())
+        self.rounded = True
+
+    def unround(self):
+        if self.round_job is not None:
+            self.after_cancel(self.round_job)
+            self.round_job = None
+        if self.rounded:
+            self.rounded = False
+            round_window(self.root, None)
+
+    def on_hover(self, event):
+        if self.drag is None and self.pressed is None:
+            self.set_hovered(self.button_at(event.x, event.y))
+
+    def set_hovered(self, name):
+        if name != self.hovered:
+            self.hovered = name
+            if win11_look():
+                self.redraw()
+
+    def move_live(self, box):
+        """Win 11 mode: the window follows the mouse (a few times a second at most, so
+        the window manager keeps up)."""
+        self.live_box = box
+        if self.move_job is None:
+            self.move_job = self.after(12, self.move_now)
+
+    def move_now(self):
+        self.move_job = None
+        box = getattr(self, "live_box", None)
+        if box is not None:
+            x, y, w, h = box
+            if self.drag is not None and not self.drag[0]:  # (just moving: same size)
+                self.root.geometry(f"+{x}+{y}")
+            else:
+                self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def buttons(self):
+        """{name: (x1, y1, x2, y2)} of the title bar's buttons."""
+        w, h = self.winfo_width(), self.winfo_height()
+        if win11_look():  # Windows 11: wide buttons right across the top
+            return {"min": (w - 138, 0, w - 92, h), "max": (w - 92, 0, w - 46, h),
+                    "close": (w - 46, 0, w, h)}
+        bw, bh = self.BUTTON
+        y = (h - bh) // 2
+        if win1_look():  # Windows 1 / 2: a box at the left (closes it), arrows at the right
+            return {"close": (0, 0, h, h - 1), "min": (w - 2 * h, 0, w - h, h - 1),
+                    "max": (w - h, 0, w, h - 1)}
+        close = w - 2 - bw
+        return {"close": (close, y, close + bw, y + bh),
+                "max": (close - 2 - bw, y, close - 2, y + bh),
+                "min": (close - 2 - 2 * bw, y, close - 2 - bw, y + bh)}
+
+    def redraw(self):
+        self.delete("all")
+        if not self.palette:
+            return
+        p = self.palette
+        w, h = self.winfo_width(), self.winfo_height()
+        if win1_look():
+            self.redraw_win1(p, w, h)
+            return
+        if win11_look():
+            self.redraw_win11(p, w, h)
+            return
+        bar, text = ((p["accent"], p["accent_fg"]) if self.active
+                     else (screen_color("#808080"), screen_color("#c0c0c0")))
+        self.create_rectangle(0, 0, w, h, fill=bar, outline="")
+        self.create_image(2, h // 2, image=self.icon, anchor="w")
+        title = self.root.title()
+        self.create_text(2 + 16 + 3, h // 2, text=title, anchor="w", fill=text,
+                         font=("TkDefaultFont", 8, "bold"))
+        black = screen_color("#000000")
+        for name, (x1, y1, x2, y2) in self.buttons().items():
+            down = self.pressed == name
+            classic_box(self, x1, y1, x2, y2, p["button"], sunken=down)
+            x, y = x1 + 4 + down, y1 + 3 + down  # (the mark moves in when pressed)
+
+            def dot(px, py, pw=1, ph=1):
+                self.create_rectangle(x + px, y + py, x + px + pw, y + py + ph, fill=black,
+                                      outline="")
+            if name == "close":
+                for row, line in enumerate(WIN95_CLOSE):
+                    for col, pixel in enumerate(line):
+                        if pixel == "#":
+                            dot(col, row)
+            elif name == "min":
+                dot(0, 6, 6, 2)
+            elif self.zoomed():  # restore: two little windows, one behind the other
+                dot(2, 0, 6, 2), dot(2, 0, 1, 4), dot(7, 0, 1, 5), dot(5, 4, 3, 1)
+                dot(0, 3, 6, 2), dot(0, 3, 1, 5), dot(5, 3, 1, 5), dot(0, 7, 6, 1)
+            else:  # maximise: a window
+                dot(0, 0, 9, 2), dot(0, 0, 1, 8), dot(8, 0, 1, 8), dot(0, 7, 9, 1)
+
+    def redraw_win11(self, p, w, h):
+        """Windows 11's title bar: the window's own grey, the penguin and the name at the
+        left, and wide flat buttons at the right that shade when the mouse is on them
+        (close goes red)."""
+        self.create_rectangle(0, 0, w, h, fill=p["bg"], outline="")
+        if self.icon11 is None:
+            try:
+                self.icon11 = tk.PhotoImage(data=base64.b64encode(icon_png(16, "light")))
+            except tk.TclError:
+                self.icon11 = False
+        if self.icon11:
+            self.create_image(12, h // 2, image=self.icon11, anchor="w")
+        words = p["fg"] if self.active else mix_color(p["fg"], p["bg"], 0.5)
+        self.create_text(12 + 16 + 12, h // 2, text=self.root.title(), anchor="w",
+                         fill=words, font=("TkDefaultFont", 9))
+        for name, (x1, y1, x2, y2) in self.buttons().items():
+            lit = self.hovered == name or self.pressed == name
+            mark = words
+            if lit and name == "close":
+                self.create_rectangle(x1, y1, x2, y2, outline="",
+                                      fill="#c42b1c" if self.pressed != name else "#c83c31")
+                mark = "#ffffff"
+            elif lit:
+                self.create_rectangle(x1, y1, x2, y2, outline="", fill=mix_color(
+                    p["bg"], p["fg"], 0.06 if self.pressed != name else 0.04))
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            if name == "min":
+                self.create_line(cx - 5, cy, cx + 5, cy, fill=mark)
+            elif name == "close":
+                self.create_line(cx - 5, cy - 5, cx + 5, cy + 5, fill=mark)
+                self.create_line(cx + 5, cy - 5, cx - 5, cy + 5, fill=mark)
+            elif self.zoomed():  # restore: two squares, one behind the other
+                self.create_rectangle(cx - 5, cy - 3, cx + 3, cy + 5, outline=mark)
+                self.create_line(cx - 3, cy - 3, cx - 3, cy - 5, cx + 5, cy - 5, cx + 5, cy + 3,
+                                 cx + 3, cy + 3, fill=mark)
+            else:
+                self.create_rectangle(cx - 5, cy - 5, cx + 5, cy + 5, outline=mark)
+
+    def redraw_win1(self, p, w, h):
+        """Windows 1's title bar: blue with the name in the middle (white when the window
+        hasn't got the keyboard), a black line under it, a box at the left and arrows at
+        the right, all flat with black lines."""
+        black = screen_color("#000000")
+        bar, text = (p["accent"], p["accent_fg"]) if self.active else (p["bg"], p["fg"])
+        self.create_rectangle(0, 0, w, h, fill=bar, outline="")
+        self.create_text(w // 2, h // 2, text=self.root.title(), fill=text,
+                         font=("TkDefaultFont", 8, "bold"))
+        self.create_line(0, h - 1, w, h - 1, fill=black)
+        for name, (x1, y1, x2, y2) in self.buttons().items():
+            down = self.pressed == name  # (pressed: black, with a white mark)
+            face, mark = (black, p["bg"]) if down else (p["bg"], black)
+            self.create_rectangle(x1, y1, x2 - 1, y2 - 1, fill=face, outline=black)
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+
+            def row(dy, half):  # one row of a triangle, `half` pixels each side
+                self.create_rectangle(cx - half, cy + dy, cx + half + 1, cy + dy + 1,
+                                      fill=mark, outline="")
+            if name == "close":  # a little bar, like the old "control menu" box
+                self.create_rectangle(cx - 4, cy - 1, cx + 5, cy + 2, fill=face,
+                                      outline=mark)
+            elif name == "min":  # an arrow pointing down
+                for i in range(4):
+                    row(i - 1, 3 - i)
+            elif self.zoomed():  # back to its size: an arrow each way
+                for i in range(3):
+                    row(i - 4, i), row(i + 2, 2 - i)
+            else:  # maximise: an arrow pointing up
+                for i in range(4):
+                    row(i - 2, i)
+
+    # ---- the title bar: its buttons, and dragging the window ----
+    def button_at(self, x, y):
+        for name, (x1, y1, x2, y2) in self.buttons().items():
+            if x1 <= x < x2 and y1 <= y < y2:
+                return name
+        return None
+
+    def on_press(self, event):
+        if win11_look() and self.edges_at(event.x_root, event.y_root):
+            return  # (the very edge: resizing, see on_root_press)
+        name = self.button_at(event.x, event.y)
+        if name:
+            self.pressed = name
+            self.redraw()
+        elif not self.zoomed():  # (a maximised window stays put, like Windows 95's)
+            self.start_drag("", event)
+
+    def on_motion(self, event):
+        if self.drag is not None:
+            self.move_outline(event)
+        elif self.pressed:  # sunk only while the pointer is still on it
+            name = self.button_at(event.x, event.y)
+            if (name == self.pressed) != getattr(self, "pressed_in", True):
+                self.pressed_in = name == self.pressed
+                self.redraw_pressed()
+
+    def redraw_pressed(self):
+        pressed = self.pressed
+        if not getattr(self, "pressed_in", True):
+            self.pressed = None
+        self.redraw()
+        self.pressed = pressed
+
+    def on_release(self, event):
+        if self.drag is not None:
+            self.end_drag()
+            return
+        name, self.pressed = self.pressed, None
+        self.pressed_in = True
+        self.redraw()
+        if name and self.button_at(event.x, event.y) == name:
+            if name == "close":
+                self.on_close()
+            elif name == "min":
+                self.root.iconify()
+            else:
+                self.toggle_zoom()
+
+    def on_double(self, event):
+        if self.button_at(event.x, event.y) is None:
+            self.cancel_drag()
+            self.toggle_zoom()
+
+    def toggle_zoom(self):
+        try:
+            self.root.wm_attributes("-zoomed", not self.zoomed())
+        except tk.TclError:
+            pass
+        self.after(100, self.redraw)
+        self.after(150, self.round_soon)
+
+    # ---- the border: resizing ----
+    def edges_at(self, x_root, y_root):
+        """Which edges of the window the pointer is on ("", "n", "se", ...)."""
+        if not self.shown or self.zoomed():
+            return ""
+        root = self.root
+        x, y = x_root - root.winfo_rootx(), y_root - root.winfo_rooty()
+        w, h, b, c = root.winfo_width(), root.winfo_height(), self.BORDER, self.CORNER
+        if not (0 <= x < w and 0 <= y < h):
+            return ""
+        on_edge = x < b or y < b or x >= w - b or y >= h - b
+        if not on_edge:
+            return ""
+        return (("n" if y < c else "s" if y >= h - c else "")
+                + ("w" if x < c else "e" if x >= w - c else ""))
+
+    def on_border(self, event):
+        """The event is on the border. (Win 11's border is thin, so anything near the
+        window's edge counts.)"""
+        if win11_look():
+            try:
+                return event.widget.winfo_toplevel() is self.root
+            except (AttributeError, KeyError, tk.TclError):
+                return False
+        return event.widget is self.root or any(event.widget is l for l, _c, _w in self.lines)
+
+    def on_root_motion(self, event):
+        if self.drag is not None or not self.shown:
+            return
+        edges = self.edges_at(event.x_root, event.y_root) if self.on_border(event) else ""
+        cursor = self.CURSORS.get(edges)
+        if cursor != self.edge_cursor:
+            self.edge_cursor = cursor
+            self.root.configure(cursor=cursor or "")
+
+    def on_root_press(self, event):
+        if self.shown and self.on_border(event):
+            edges = self.edges_at(event.x_root, event.y_root)
+            if edges:
+                self.start_drag(edges, event)
+
+    def on_root_drag(self, event):
+        if self.drag is not None and self.drag[0] and self.on_border(event):
+            self.move_outline(event)
+
+    def on_root_release(self, event):
+        if self.drag is not None and self.drag[0] and self.on_border(event):
+            self.end_drag()
+
+    # ---- the dotted outline ----
+    def start_drag(self, edges, event):
+        root = self.root
+        self.drag = (edges, event.x_root, event.y_root, root.winfo_rootx(), root.winfo_rooty(),
+                     root.winfo_width(), root.winfo_height())
+        self.outline_at = None
+
+    def outline_box(self, event):
+        """Where the window would go (x, y, w, h), for the pointer where it is now."""
+        edges, px, py, x, y, w, h = self.drag
+        dx, dy = event.x_root - px, event.y_root - py
+        if not edges:
+            return x + dx, y + dy, w, h
+        least_w, least_h = self.root.minsize()
+        if "e" in edges:
+            w = max(least_w, w + dx)
+        if "s" in edges:
+            h = max(least_h, h + dy)
+        if "w" in edges:
+            new_w = max(least_w, w - dx)
+            x, w = x + w - new_w, new_w
+        if "n" in edges:
+            new_h = max(least_h, h - dy)
+            y, h = y + h - new_h, new_h
+        return x, y, w, h
+
+    def make_outline(self):
+        """4 thin windows, dotted black and white, that make the outline."""
+        for _ in range(4):
+            strip = tk.Toplevel(self.root)
+            strip.withdraw()
+            strip.overrideredirect(True)
+            try:
+                strip.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            canvas = tk.Canvas(strip, highlightthickness=0, bd=0, bg="#ffffff")
+            canvas.pack(fill="both", expand=True)
+            canvas.create_rectangle(0, 0, 4000, 4000, fill="#000000", outline="",
+                                    stipple="gray50")
+            self.outline.append(strip)
+
+    def move_outline(self, event):
+        box = self.outline_box(event)
+        if win11_look():  # (Windows 11 moves the window itself, as you drag)
+            self.outline_at = box
+            self.move_live(box)
+            return
+        if box == self.outline_at:
+            return
+        if not self.outline:
+            self.make_outline()
+        self.outline_at = box
+        x, y, w, h = box
+        t = self.LINE
+        for strip, (sx, sy, sw, sh) in zip(self.outline, (
+                (x, y, w, t), (x, y + h - t, w, t), (x, y + t, t, h - 2 * t),
+                (x + w - t, y + t, t, h - 2 * t))):
+            strip.geometry(f"{max(1, sw)}x{max(1, sh)}+{sx}+{sy}")
+            if strip.state() == "withdrawn":
+                strip.deiconify()
+                strip.lift()
+
+    def end_drag(self):
+        """Let go: the window jumps to where the outline is."""
+        box = self.outline_at
+        if win11_look() and self.move_job is not None:
+            self.after_cancel(self.move_job)
+            self.move_job = None
+        self.cancel_drag()
+        if box is not None:
+            x, y, w, h = box
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def cancel_drag(self):
+        self.drag = None
+        self.outline_at = None
+        for strip in self.outline:
+            strip.withdraw()
+
+
 class AutoClicker:
     SYNTHETIC_WINDOW = 0.03  # seconds: presses this soon after our own click/press are ours
     REPEAT_WINDOW = 0.2      # seconds: the same key again this soon is a duplicate/held key
@@ -5128,6 +6504,7 @@ class AutoClicker:
         self.nav_buttons = {}
         self.key_choosers = []
         self.optional_rows = []   # (widgets, should_show) pairs, see show_optional_rows
+        self.descriptions = []    # grey words explaining things (retro mode hides them)
         self.column_groups = []   # side-by-side fields, see field_columns
         self.cards = []           # (card, heading) pairs, see card_section
         self.card_frames = []     # plain frames on cards, recoloured with the theme
@@ -5173,6 +6550,24 @@ class AutoClicker:
         self.setup_fonts()
 
         saved = load_settings()
+        # Win 95 or Win 1 mode ("95" / "1"), see win95_look and win1_look
+        self.old_win = "95" if saved["win95_mode"] else "1" if saved["win1_mode"] else None
+        self.classic = saved["retro_mode"] or bool(self.old_win)  # the retro look (classic_look)
+        self.secret = saved["super_secret_options"]  # (only ever set in the file)
+        _classic[0] = self.classic
+        _old_windows[0] = self.old_win
+        self.win11_on = saved["win11_mode"]  # Win 11 mode, see win11_look
+        _win11[0] = self.win11_on
+        self.switching_look = False
+        if self.old_win:
+            set_text_smoothing(False)
+        if self.classic:
+            self.apply_font_family()
+            self.root.geometry(RETRO_SIZE)
+        elif self.win11_on:
+            self.apply_font_family()
+        self.settings_seen = None        # settings.json's last change we know about
+        self.last_file_check = 0.0
         self.locations = saved["locations"] or []  # click spots: one, or several in a row
         self.area = list(saved["area"])            # the shapes "Click across an area" clicks
         self.area_plan = None                      # AreaPlan for self.area, see area_plan_now
@@ -5193,6 +6588,8 @@ class AutoClicker:
         self.recording_name = None  # the profile the current recording came from, if any
         self.recording = self.load_current_recording(saved)
         self.build_ui(saved)
+        if self.classic:  # (now the window is allowed to be that small)
+            self.root.geometry(RETRO_SIZE)
 
         threading.Thread(target=self.click_loop, daemon=True).start()
         self.listener = keyboard.Listener(on_press=self.on_key, on_release=self.on_key_release)
@@ -5295,6 +6692,33 @@ class AutoClicker:
         self.font_caption = tkfont.Font(family=family, size=FONT_SIZE - 1, weight="bold")
         self.font_badge_small = tkfont.Font(family=family, size=FONT_SIZE - 3, weight="bold")
         self.font_nav = tkfont.Font(family=family, size=FONT_SIZE)  # menu buttons
+        self.modern_family = family
+
+    def apply_font_family(self):
+        """The classic look uses Tk's own plain font (DejaVu Sans); otherwise the clean one
+        picked in setup_fonts."""
+        family = self.modern_family
+        installed = tkfont.families(self.root)
+        if self.old_win:  # (something like old Windows' plain font)
+            family = next((f for f in WIN95_FONTS if f in installed), family)
+        elif self.win11_on:  # (Windows 11's, or one like it)
+            family = next((f for f in WIN11_FONTS if f in installed), family)
+        elif self.classic and "DejaVu Sans" in installed:
+            family = "DejaVu Sans"
+        fonts = [self.font_title, self.font_brand, self.font_section, self.font_caption,
+                 self.font_badge_small, self.font_nav]
+        for name in NAMED_FONTS:
+            try:
+                fonts.append(tkfont.nametofont(name))
+            except tk.TclError:
+                pass
+        if not hasattr(self, "font_weights"):  # (each one's own weight, to go back to)
+            self.font_weights = {str(font): font.cget("weight") for font in fonts}
+        bold = self.old_win == "1"  # (Windows 1's system font was thick and chunky)
+        for font in fonts:
+            font.configure(family=family,
+                           weight="bold" if bold else self.font_weights.get(str(font),
+                                                                            "normal"))
 
     # ---------------- UI ----------------
     def build_ui(self, saved: dict):
@@ -5316,6 +6740,21 @@ class AutoClicker:
         self.area_in_order = tk.BooleanVar(value=saved["area_in_order"])
         self.multi_location = tk.BooleanVar(value=saved["multi_location"])
         self.hold = tk.BooleanVar(value=saved["hold"])
+        # Bursts and the colour trigger (see build_clicker_page)
+        self.burst_on = tk.BooleanVar(value=saved["burst_on"])
+        self.burst_clicks = tk.IntVar(value=saved["burst_clicks"])
+        self.burst_rest = tk.DoubleVar(value=saved["burst_rest"])
+        self.trigger_on = tk.BooleanVar(value=saved["trigger_on"])
+        self.trigger_when = tk.StringVar(value=saved["trigger_when"])
+        self.trigger_tolerance = tk.IntVar(value=saved["trigger_tolerance"])
+        self.trigger_box = saved["trigger_box"]      # [x1, y1, x2, y2] or None
+        self.trigger_color = saved["trigger_color"]  # "#rrggbb" or ""
+        self.trigger_ok = False      # (while running) the colour trigger says click
+        self.waiting_for = None      # (while running) "colour" or "rest": not clicking
+        self.resting_until = None    # (while running) when a burst's rest ends
+        self.stats = saved["stats"]  # Settings > Stats, see count_run
+        self.run_started = None      # when the current run began clicking
+        self.run_done = 0            # what it's done so far (clicks or key presses)
         # Macros
         self.macro_wait = tk.DoubleVar(value=saved["macro_wait"])
         self.macro_delay = tk.DoubleVar(value=saved["macro_delay"])
@@ -5372,6 +6811,10 @@ class AutoClicker:
         self.text_size = tk.StringVar(value=saved["text_size"])
         self.dark = tk.BooleanVar(value=saved["dark_mode"])
         self.accent = tk.StringVar(value=saved["accent"])
+        self.retro = tk.BooleanVar(value=saved["retro_mode"])
+        self.win95 = tk.BooleanVar(value=saved["win95_mode"])
+        self.win1 = tk.BooleanVar(value=saved["win1_mode"])
+        self.win11 = tk.BooleanVar(value=saved["win11_mode"])
         self.active_mode = saved["active_mode"]
         self.page = tk.StringVar(value=MODE_PAGES[self.active_mode])  # open where you left off
 
@@ -5382,6 +6825,9 @@ class AutoClicker:
             "limit_on": self.limit_on, "limit": self.limit,
             "time_limit_on": self.time_limit_on, "time_limit": self.time_limit,
             "delay": self.delay, "location_on": self.location_on, "hold": self.hold,
+            "burst_on": self.burst_on, "burst_clicks": self.burst_clicks,
+            "burst_rest": self.burst_rest, "trigger_on": self.trigger_on,
+            "trigger_when": self.trigger_when, "trigger_tolerance": self.trigger_tolerance,
             "kb_key": self.kb_key, "kb_cps": self.kb_cps,
             "kb_delay": self.kb_delay, "kb_limit_on": self.kb_limit_on,
             "kb_limit": self.kb_limit, "kb_time_limit_on": self.kb_time_limit_on,
@@ -5401,7 +6847,7 @@ class AutoClicker:
 
         # Apply the starting colours instantly (no animation on launch)
         self.style.theme_use("clam")
-        self.apply_palette(build_palette(saved["dark_mode"], saved["accent"]))
+        self.apply_palette(self.wanted_palette())
 
         self.hotkey.trace_add("write", lambda *_: self.refresh_button())
         self.location_key.trace_add("write", lambda *_: self.refresh_location())
@@ -5432,6 +6878,10 @@ class AutoClicker:
         for var in (self.macro_wait, self.macro_loop, self.macro_limit_on, self.macro_limit):
             var.trace_add("write", lambda *_: self.refresh_macro())
         self.dark.trace_add("write", lambda *_: self.animate_theme())
+        self.retro.trace_add("write", lambda *_: self.look_changed(self.retro))
+        self.win95.trace_add("write", lambda *_: self.look_changed(self.win95))
+        self.win1.trace_add("write", lambda *_: self.look_changed(self.win1))
+        self.win11.trace_add("write", lambda *_: self.look_changed(self.win11))
         self.accent.trace_add("write", lambda *_: self.animate_theme())
 
         # Layout: menu | handle | page. The menu can sit on any side (see layout_sidebar)
@@ -5441,6 +6891,8 @@ class AutoClicker:
                                                   self.save_settings, self.reset_sidebar))
         content = ttk.Frame(self.root, padding=20)
         self.content = content
+        # Win 95 mode's own title bar and border, see Win95TitleBar
+        self.win95_frame = self.register(Win95TitleBar(self.root, self.on_close))
 
         # Menu: logo, page buttons, then the status at the far end
         self.logo = self.register(Logo(sidebar, self.font_brand,
@@ -5448,7 +6900,19 @@ class AutoClicker:
         pages = (("clicker", "Mouse"), ("areas", "Areas"), ("macros", "Macros"),
                  ("keyboard", "Keyboard"), ("recording", "Profiles"), ("settings", "Settings"))
         # the page buttons sit together in a rounded card, with thin lines between them
-        self.nav_card = self.register(Card(sidebar))
+        # The card sits in a strip that can scroll sideways: in retro mode with the menu
+        # along the top or bottom, an old Tk scroll bar shows under it when the window is
+        # too narrow for all the buttons. Otherwise the strip is just the card's size.
+        # (The card has to be made inside the strip for the strip to cut it off.)
+        self.nav_strip = tk.Canvas(sidebar, highlightthickness=0, bd=0, width=1, height=1)
+        self.nav_scrollbar = tk.Scrollbar(sidebar, orient="horizontal",
+                                          command=self.nav_strip.xview)
+        self.nav_strip.configure(xscrollcommand=self.nav_strip_moved)
+        self.nav_card = self.register(Card(self.nav_strip))
+        self.nav_window = self.nav_strip.create_window(0, 0, window=self.nav_card,
+                                                       anchor="nw")
+        self.nav_card.bind("<Configure>", lambda e: self.fit_nav_strip(), add="+")
+        self.nav_strip.bind("<Configure>", lambda e: self.fit_nav_strip(), add="+")
         self.nav_lines = []
         for i, (name, label) in enumerate(pages):
             self.nav_buttons[name] = self.register(
@@ -5467,6 +6931,10 @@ class AutoClicker:
         # a light that's accent coloured while running, grey when stopped
         self.status_dot = self.register(StatusDot(status_row))
         self.status_dot.grid(row=0, column=0, sticky="n", pady=(4, 0), padx=(0, 6))
+        if self.classic:  # (the first version had no light: just the words)
+            self.status_dot.grid_remove()
+            if not self.old_win:  # (old Windows looks keep the name, in their title bar)
+                self.root.title("Auto Clicker")
         self.status = ttk.Label(status_row, text="Stopped", justify="left")
         self.status.grid(row=0, column=1, sticky="w")
         # always-visible reminder of the emergency stop
@@ -5503,7 +6971,8 @@ class AutoClicker:
         for var in (self.click_delay_on, self.limit_on, self.time_limit_on, self.location_on,
                     self.multi_location, self.hold, self.kb_limit_on, self.kb_time_limit_on,
                     self.kb_hold, self.replay_loop, self.replay_limit_on, self.record_keys_only,
-                    self.record_moves, self.area_on, self.macro_loop, self.macro_limit_on):
+                    self.record_moves, self.area_on, self.macro_loop, self.macro_limit_on,
+                    self.burst_on, self.trigger_on):
             var.trace_add("write", lambda *_: self.show_optional_rows())
         self.show_optional_rows()
 
@@ -5519,8 +6988,14 @@ class AutoClicker:
         # after the window is resized, things have moved: redraw so nothing is left behind
         self.root.bind("<Configure>", lambda e: e.widget is self.root and self.repaint_soon(),
                        add="+")
-        if self.text_size.get() != "Normal":
+        for widget in [self.nav_strip] + list(self.nav_buttons.values()):
+            for sequence in ("<Button-4>", "<Button-5>", "<Shift-Button-4>",
+                             "<Shift-Button-5>"):
+                widget.bind(sequence, self.scroll_nav, add="+")
+        if self.text_size.get() != "Normal" or self.classic:
             self.apply_text_size()
+        if self.classic:
+            self.compact_widgets()
         self.root.after(300, self.refresh_running)  # once the window has its place on screen
         self.mini.trace_add("write", lambda *_: self.apply_mini())
         if self.mini.get():  # once the window is on screen (its title bar can't go before)
@@ -5546,6 +7021,12 @@ class AutoClicker:
     def register(self, widget, surface=None):
         """Theme a custom widget now and on every colour change. surface="card" gives it
         the card colours, for widgets that sit on a card."""
+        if isinstance(widget, (RoundedButton, RoundedSpin, RoundedCombo, RoundedEntry,
+                               KeyChooser, ToggleSwitch)):
+            widget.base_height = int(widget.cget("height"))  # (see compact_widgets)
+            widget.base_width = int(widget.cget("width"))
+            if self.classic and widget not in self.nav_buttons.values():
+                widget.configure(height=retro_height(widget.base_height))
         widget.surface = surface or self.default_surface
         widget.set_palette(self.surface_palette(widget.surface))
         self.round_widgets.append(widget)
@@ -5638,10 +7119,12 @@ class AutoClicker:
             slot.grid(row=line, column=col, sticky="ew", padx=(left, right),
                       pady=(8 if line else 0, 0))
 
-    @staticmethod
-    def flow_label(label, reserve=0, most=500):
+    def flow_label(self, label, reserve=0, most=500, describes=True):
         """Make a label's text wrap to fit the page (up to `most` pixels wide), leaving
-        `reserve` pixels for whatever sits beside it."""
+        `reserve` pixels for whatever sits beside it. describes: it's a description (grey
+        words explaining something), which retro mode leaves out."""
+        if describes:
+            self.descriptions.append(label)
         # (8: the label's own padding sits outside its wrap width)
         label.master.bind("<Configure>", lambda e: label.configure(
             wraplength=max(150, min(most, e.width - reserve - 8))), add="+")
@@ -5703,6 +7186,7 @@ class AutoClicker:
             subtitle_label = ttk.Label(words, text=subtitle, style="CardMuted.TLabel",
                                        wraplength=320, justify="left")
             subtitle_label.grid(row=1, column=0, sticky="w", pady=(1, 0))
+            self.descriptions.append(subtitle_label)
 
         box = None
         if value:
@@ -5901,6 +7385,14 @@ class AutoClicker:
             card, "Click across an area", self.area_on, subtitle="",
             value=lambda p: self.button_group(p, [("Edit", lambda: self.go_to("areas"))]),
             show=clicking)
+        # Bursts: a number of clicks, then a rest, over and over
+        self.card_row(card, "Bursts (clicks in each)", self.burst_on,
+                      subtitle="Click a set number of times, rest, then go again",
+                      value=lambda p: self.make_spin(p, self.burst_clicks, 1, 1000000, 5),
+                      value_show=self.burst_on.get, show=clicking)
+        self.card_row(card, "Rest between bursts (seconds)",
+                      value=lambda p: self.make_spin(p, self.burst_rest, 0, 3600, 1),
+                      show=lambda: clicking() and self.burst_on.get())
 
         card = self.card_section(sub, 3, "Stopping")
         self.card_row(card, "After a number of clicks", self.limit_on,
@@ -5910,10 +7402,71 @@ class AutoClicker:
                       value=lambda p: self.make_spin(p, self.time_limit, 1, 86400, 5),
                       value_show=self.time_limit_on.get)
 
+        # Colour trigger: watch a box on the screen, click only while a colour's there
+        card = self.card_section(sub, 5, "Colour trigger")
+        _, self.trigger_hint, _ = self.card_row(
+            card, "Only click when a colour shows", self.trigger_on, subtitle="",
+            value=self.trigger_controls, value_show=self.trigger_on.get, show=clicking)
+        self.card_row(card, "Click while the colour is",
+                      value=lambda p: self.make_combo(p, self.trigger_when, list(TRIGGER_WHEN)),
+                      show=lambda: clicking() and self.trigger_on.get())
+        self.card_row(card, "How close the colour must be",
+                      subtitle="0 is that exact colour; higher lets nearby shades count too",
+                      value=lambda p: self.make_spin(p, self.trigger_tolerance, 0, 255, 5),
+                      show=lambda: clicking() and self.trigger_on.get())
+        self.refresh_trigger()
+
 
         self.toggle_btn = self.make_button(frame, "", self.toggle, height=42, selectable=True,
                                            accent=True)
         self.toggle_btn.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+
+    def trigger_controls(self, parent):
+        """The colour trigger's buttons: Box (where to watch) and Colour (what for), with
+        a little square showing the colour."""
+        frame = self.button_group(parent, [("Box", self.pick_trigger_box, 52),
+                                           ("Colour", self.pick_trigger_colour, 64)])
+        self.trigger_swatch = tk.Canvas(frame, width=20, height=20, highlightthickness=1,
+                                        highlightbackground="#808080", bd=0)
+        self.trigger_swatch.grid(row=0, column=2, padx=(8, 0))
+        return frame
+
+    def refresh_trigger(self):
+        """Show the colour trigger's box and colour (or what to do first)."""
+        box, color = self.trigger_box, self.trigger_color
+        if box and color:
+            x1, y1, x2, y2 = box
+            text = (f"Watching a {x2 - x1}\u00d7{y2 - y1} box at {x1}, {y1} for {color}"
+                    if (x2 - x1, y2 - y1) != (1, 1) else f"Watching the spot {x1}, {y1} for {color}")
+        elif box:
+            text = "Now press Colour and click the colour to watch for"
+        else:
+            text = "Press Box and drag round the part of the screen to watch"
+        if self.trigger_hint is not None:
+            self.trigger_hint.configure(text=text)
+        swatch = getattr(self, "trigger_swatch", None)
+        if swatch is not None:
+            swatch.configure(bg=color or self.palette["card"])
+
+    def pick_trigger_box(self, mode="box"):
+        """Open the colour trigger's menu (like the Areas one), on Box or Colour."""
+        TriggerBoxDrawer(self.root, self.trigger_box, self.trigger_color,
+                         self.trigger_drawn, accent=self.palette["accent"], mode=mode)
+
+    def pick_trigger_colour(self):
+        self.pick_trigger_box("colour")
+
+    def trigger_drawn(self, box, colour):
+        """The colour trigger's menu closed: keep its box and colour."""
+        if (box, colour) == (self.trigger_box, self.trigger_color):
+            return
+        self.trigger_box, self.trigger_color = box, colour
+        if box:
+            self.trigger_on.set(True)
+        self.refresh_trigger()
+        self.save_settings()
+        self.status.config(text=f"Watching for {colour}" if box and colour
+                           else "Now pick a colour too" if box else "Now draw a box too")
 
     def build_areas_page(self, frame):
         """Shapes drawn on the screen; the mouse clicker clicks every spot inside them."""
@@ -6171,7 +7724,8 @@ class AutoClicker:
         self.make_button(rec_row, "Clear", self.clear_recording, height=FIELD_HEIGHT,
                          width=80).grid(row=0, column=2, padx=(10, 0))
         self.recording_info = self.flow_label(ttk.Label(sub, text="", style="Muted.TLabel",
-                                                        wraplength=500, justify="left"))
+                                                        wraplength=500, justify="left"),
+                                              describes=False)  # (what's recorded: kept)
         self.recording_info.grid(row=10, column=0, sticky="w", pady=(4, 0))
 
         card = self.card_section(sub, 11, "While recording")
@@ -6272,7 +7826,9 @@ class AutoClicker:
 
     def shape_mini(self, width, height):
         if self.mini_shown:
-            round_window(self.root, Card.RADIUS + MINI_MARGIN, width, height)
+            # (square in the old looks, like everything else in them)
+            round_window(self.root, None if self.classic else Card.RADIUS + MINI_MARGIN,
+                         width, height)
         self.set_alpha(1.0)
 
     def set_alpha(self, value):
@@ -6309,7 +7865,8 @@ class AutoClicker:
             self.mini_shown = True
             for widget in (self.sidebar, self.handle, self.content):
                 widget.grid_remove()
-            for i in range(3):
+            self.win95_frame.remove_parts()  # (mini mode has its own look)
+            for i in range(4):
                 root.columnconfigure(i, weight=0, minsize=0)
                 root.rowconfigure(i, weight=0, minsize=0)
             root.columnconfigure(0, weight=1)
@@ -6336,7 +7893,8 @@ class AutoClicker:
             self.mini_shown = False
             x, y = root.winfo_rootx(), root.winfo_rooty()
             round_window(root, None)    # the window is square again
-            set_title_bar(root, True)   # and gets its title bar back
+            set_title_bar(root, not self.own_frame())  # and gets its title bar back (or
+            # Win 95 mode's own, see layout_sidebar)
             root.withdraw()             # (shown again below, so the title bar appears)
             root.resizable(True, True)
             self.mini_frame.grid_remove()
@@ -6372,8 +7930,9 @@ class AutoClicker:
 
         card = self.card_section(sub, 2, "Appearance")
         self.card_row(card, "Accent colour",
-                      value=lambda p: self.make_swatches(p, self.accent, ACCENTS))
-        self.card_row(card, "Dark mode", self.dark)
+                      value=lambda p: self.make_swatches(p, self.accent, ACCENTS),
+                      show=lambda: not self.classic)
+        self.card_row(card, "Dark mode", self.dark, show=lambda: not self.classic)
         self.card_row(card, "Text size",
                       value=lambda p: self.make_combo(p, self.text_size, list(TEXT_SIZES)))
         self.card_row(card, "Menu position",
@@ -6431,18 +7990,130 @@ class AutoClicker:
                           ("Check now", lambda: self.look_for_update(quiet=False), 84)]))
         self.refresh_version_text()
 
+        # only there once "super_secret_options" is true in settings.json (see
+        # check_settings_file): the section hides itself while its row is hidden
+        # what Pengclick has done (see count_run)
+        card = self.card_section(sub, 12, "Stats")
+        self.stat_labels = {}
+        for name, title in (("clicks", "Clicks"), ("presses", "Key presses"),
+                            ("runs", "Times started"), ("seconds", "Time spent clicking"),
+                            ("last", "Last run")):
+            self.card_row(card, title, value=lambda p, n=name: self.stat_label(p, n))
+        self.reset_stats_btn = None
+        self.card_row(card, "Reset stats", subtitle="Sets them all back to 0",
+                      value=lambda p: self.button_group(p, [("Reset", self.reset_stats)]))
+        self.refresh_stats()
+
+        card = self.card_section(sub, 14, "Super secret options")
+        self.card_row(card, "Retro mode", self.retro,
+                      subtitle="The look of the very first version: plain grey, old-style "
+                               "buttons and boxes, no logo or colours",
+                      show=lambda: self.secret)
+        self.card_row(card, "Win 95 mode", self.win95,
+                      subtitle="Even older: as if it ran on Windows 95, with 16 colours, "
+                               "chunky 3D edges and pixelly text",
+                      show=lambda: self.secret)
+        self.card_row(card, "Win 1 mode", self.win1,
+                      subtitle="Older still: Windows 1.0 from 1985, all white with thin "
+                               "black lines and chunky bold text",
+                      show=lambda: self.secret)
+        self.card_row(card, "Win 11 mode", self.win11,
+                      subtitle="Back to now: as if it ran on Windows 11, with its greys, "
+                               "switches and title bar",
+                      show=lambda: self.secret)
+        self.card_row(card, "Super Secret Settings...",
+                      subtitle="Like the button in old Minecraft: a random filter (and a "
+                               "random sound) every click",
+                      value=lambda p: self.button_group(p, [("Click me", self.shuffle_filter, 72),
+                                                            ("Off", self.filter_off, 44)]),
+                      show=lambda: self.secret)
+
         self.make_button(frame, "Reset to defaults", self.reset_defaults, height=36).grid(
             row=2, column=0, sticky="ew", pady=(14, 0))
 
+    def stat_label(self, parent, name):
+        label = ttk.Label(parent, style="Card.TLabel", text="")
+        self.stat_labels[name] = label
+        return label
+
+    @staticmethod
+    def clock(seconds):
+        """A time like 0:42 or 1:05:00."""
+        seconds = int(seconds)
+        h, rest = divmod(seconds, 3600)
+        return f"{h}:{rest // 60:02d}:{rest % 60:02d}" if h else f"{rest // 60}:{rest % 60:02d}"
+
+    def refresh_stats(self):
+        """Show the stats (with the run going now, if there is one)."""
+        labels = getattr(self, "stat_labels", None)
+        if not labels:
+            return
+        st = dict(self.stats)
+        if self.run_started is not None:  # (a run's going: count it in already)
+            unit = "presses" if self.settings.get("mode") == "keyboard" else "clicks"
+            st[unit] += self.run_done
+            st["seconds"] += time.monotonic() - self.run_started
+        labels["clicks"].configure(text=f"{int(st['clicks']):,}")
+        labels["presses"].configure(text=f"{int(st['presses']):,}")
+        labels["runs"].configure(text=f"{int(st['runs']):,}")
+        labels["seconds"].configure(text=self.clock(st["seconds"]))
+        if st["runs"]:
+            count, unit = int(st["last_count"]), st["last_unit"]
+            words = f"{unit}es" if unit == "press" else f"{unit}s"
+            labels["last"].configure(
+                text=f"{count:,} {unit if count == 1 else words} in "
+                     f"{self.clock(st['last_seconds'])}")
+        else:
+            labels["last"].configure(text="None yet")
+
+    def count_run(self):
+        """A run ended: add what it did to the stats."""
+        if self.run_started is None:
+            return
+        seconds = time.monotonic() - self.run_started
+        self.run_started = None
+        keyboard = self.settings.get("mode") == "keyboard"
+        self.stats["presses" if keyboard else "clicks"] += self.run_done
+        self.stats["runs"] += 1
+        self.stats["seconds"] += seconds
+        self.stats.update(last_count=self.run_done, last_seconds=seconds,
+                          last_unit="press" if keyboard else "click")
+        self.refresh_stats()
+
+    def reset_stats(self):
+        """Reset: press once more within a few seconds to be sure."""
+        if not getattr(self, "stats_armed", False):
+            self.stats_armed = True
+            self.status.config(text="Press Reset again to clear the stats")
+            self.root.after(4000, lambda: setattr(self, "stats_armed", False))
+            return
+        self.stats_armed = False
+        self.stats = clean_stats({})
+        self.refresh_stats()
+        self.save_settings()
+        self.status.config(text="Stats cleared")
+
     def show_optional_rows(self):
-        """Show or hide everything that depends on a toggle (see card_row, field_columns)."""
+        """Show or hide everything that depends on a toggle (see card_row, field_columns),
+        and the descriptions (not in retro mode)."""
+        optional = set()
         for widgets, should_show in self.optional_rows:
-            visible = should_show()
+            visible = should_show() and not (self.classic and widgets[0] in self.descriptions)
             for widget in widgets:
+                optional.add(widget)
                 if visible:
                     widget.grid()
                 else:
                     widget.grid_remove()
+        for label in self.descriptions:
+            if self.classic:
+                label.grid_remove()
+            elif label not in optional:
+                label.grid()
+        if self.classic:  # (and the reminder under the status)
+            self.esc_hint.grid_remove()
+        else:
+            self.esc_hint.grid()
 
         for group in self.column_groups:
             self.layout_fields(group)
@@ -6485,9 +8156,13 @@ class AutoClicker:
         side = self.sidebar_side.get()
         vertical = self.menu_is_vertical()
         root, bar = self.root, self.sidebar
-        for i in range(3):
+        for i in range(4):
             root.columnconfigure(i, weight=0, minsize=0)
             root.rowconfigure(i, weight=0, minsize=0)
+        top = 1 if self.own_frame() else 0  # (Windows looks: their title bar is the top row)
+        self.win95_frame.show(self.own_frame())
+        if self.own_frame():
+            self.win95_frame.place_parts()
         for i in range(12):
             bar.columnconfigure(i, weight=0)
             bar.rowconfigure(i, weight=0)
@@ -6499,13 +8174,15 @@ class AutoClicker:
         for i, widget in enumerate(order):
             sticky = ("ns" if vertical else "ew") if widget is self.handle else "nsew"
             if vertical:
-                widget.grid(row=0, column=i, sticky=sticky)
+                widget.grid(row=top, column=i, sticky=sticky)
             else:
-                widget.grid(row=i, column=0, sticky=sticky)
+                widget.grid(row=top + i, column=0, sticky=sticky)
         page_at, self.sidebar_index = order.index(self.content), order.index(bar)
+        if not vertical:  # (rows, below the title bar)
+            page_at, self.sidebar_index = page_at + top, self.sidebar_index + top
         if vertical:
             root.columnconfigure(page_at, weight=1)
-            root.rowconfigure(0, weight=1)
+            root.rowconfigure(top, weight=1)
         else:
             root.rowconfigure(page_at, weight=1)
             root.columnconfigure(0, weight=1)
@@ -6517,12 +8194,17 @@ class AutoClicker:
             body.rowconfigure(i, weight=0)
         self.nav_card.set_fit(not vertical)
         for i, btn in enumerate(nav):
+            btn.pill = "left" if vertical else "bottom"
             line = self.nav_lines[i - 1] if i else None
             if vertical:
                 if line is not None:
                     line.configure(height=1, width=1)
                     line.grid(row=2 * i - 1, column=0, sticky="ew", padx=6, pady=0)
                 btn.grid(row=2 * i, column=0, sticky="ew", padx=0, pady=1)
+            elif self.classic:  # (retro: in a row, no lines)
+                if line is not None:
+                    line.grid_remove()
+                btn.grid(row=0, column=2 * i, sticky="", padx=1, pady=1)
             else:
                 if line is not None:
                     line.configure(width=1, height=18)
@@ -6534,44 +8216,115 @@ class AutoClicker:
         if vertical:  # a tall menu: logo, the button card, status at the bottom
             bar.configure(padding=(8, 12))
             bar.columnconfigure(0, weight=1)
-            self.logo.grid(row=0, column=0, rowspan=1, sticky="w", padx=0, pady=(0, 14))
+            self.logo.grid(row=0, column=0, rowspan=1, sticky="ew" if self.old_win else "w",
+                           padx=0, pady=(0, 14))  # (Win 95's title bar goes right across)
             # the card wraps the buttons; the buttons grow with the window so the card
             # reaches about halfway down the menu (see size_nav_buttons)
-            self.nav_card.grid(row=1, column=0, rowspan=1, sticky="ew", padx=0, pady=0)
+            self.nav_strip.grid(row=1, column=0, rowspan=1, sticky="ew", padx=0, pady=0)
             bar.rowconfigure(2, weight=1)  # pushes the status to the bottom
-            self.mini_switch.set_text("Mini mode")
+            self.mini_switch.set_text("Mini" if self.classic else "Mini mode")
             self.mini_switch.grid(row=2, column=0, sticky="nw", padx=4, pady=(12, 0))
             self.status_row.grid(row=3, column=0, sticky="ew", padx=0, pady=(10, 2))
             self.esc_hint.grid(row=4, column=0, sticky="w", padx=0, pady=(4, 0))
             self.set_sidebar_width(self.sidebar_width)
         else:  # a slim bar: logo, the button card in a row, status at the far end
             bar.configure(padding=(12, 8))
-            self.logo.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 16), pady=0)
-            self.nav_card.grid(row=0, column=1, rowspan=2, sticky="", padx=0, pady=0)
-            bar.columnconfigure(2, weight=1)  # pushes the status to the far end
+            self.logo.grid(row=0, column=0, rowspan=3, sticky="w", padx=(0, 16), pady=0)
+            if self.classic:  # retro: the strip of buttons stretches and scrolls sideways
+                # when they don't fit, so the window can be small
+                self.nav_strip.grid(row=0, column=1, rowspan=2, sticky="ew", padx=0, pady=0)
+                bar.columnconfigure(1, weight=1)
+            else:
+                self.nav_strip.grid(row=0, column=1, rowspan=2, sticky="", padx=0, pady=0)
+                bar.columnconfigure(2, weight=1)  # pushes the status to the far end
             self.mini_switch.set_text("Mini")  # (short, so the bar stays narrow)
-            self.mini_switch.grid(row=0, column=2, rowspan=2, sticky="w", padx=(12, 0), pady=0)
+            if self.classic:  # retro: under the status, so the bar can be narrow
+                self.mini_switch.grid(row=1, column=3, rowspan=1, sticky="ne", padx=(12, 0),
+                                      pady=0)
+            else:
+                self.mini_switch.grid(row=0, column=2, rowspan=2, sticky="w", padx=(12, 0),
+                                      pady=0)
             # status and Esc hint stay together in the middle, however tall the bar is
             bar.rowconfigure(0, weight=1)
             bar.rowconfigure(1, weight=1)
             self.status_row.grid(row=0, column=3, sticky="se", padx=(12, 0), pady=0)
             self.esc_hint.grid(row=1, column=3, sticky="ne", padx=(12, 0), pady=0)
-            self.status.configure(wraplength=0)
+            self.status.configure(wraplength=100 if self.classic else 0)
             self.esc_hint.configure(wraplength=0)
             self.set_bar_height(self.bar_height)
+        if self.classic:  # (the old looks have no Esc reminder, see show_optional_rows)
+            self.esc_hint.grid_remove()
+        if self.own_frame():  # (Windows looks: the window's own title bar has the name)
+            self.logo.grid_remove()
         self.size_nav_buttons()
+        self.nav_strip.xview_moveto(0)
+        self.fit_nav_strip()
+
+    NAV_STRIP_MIN = 130  # the least room a retro top/bottom bar keeps for its buttons
+
+    def retro_bar_room(self):
+        """How wide a retro top/bottom bar is without its page buttons."""
+        logo = 0 if self.old_win else self.logo.winfo_reqwidth() + 16
+        return (logo + 24 + 12
+                + max(70, self.mini_switch.winfo_reqwidth(), self.status_row.winfo_reqwidth()))
+
+    def nav_scrolls(self):
+        """True when the page buttons are in a strip that can scroll (retro, top/bottom)."""
+        return self.classic and not self.menu_is_vertical()
+
+    def fit_nav_strip(self):
+        """Size the strip of page buttons to its card: a side menu's card stretches with
+        the strip; a top/bottom one is as wide as its buttons, and in retro mode the
+        strip is narrower than that when the window is, and scrolls."""
+        card, strip = self.nav_card, self.nav_strip
+        h = card.winfo_reqheight()
+        if self.menu_is_vertical():
+            width = max(1, strip.winfo_width())
+            look = (width, h)
+            if getattr(self, "nav_strip_look", None) != look:
+                self.nav_strip_look = look
+                strip.itemconfigure(self.nav_window, width=width, height=0)  # (0: its own)
+                strip.configure(height=h, width=1, scrollregion=(0, 0, width, h))
+            return
+        w = card.winfo_reqwidth()
+        look = (w, h, self.nav_scrolls())
+        if getattr(self, "nav_strip_look", None) != look:
+            self.nav_strip_look = look
+            strip.itemconfigure(self.nav_window, width=0, height=0)  # (its own size)
+            strip.configure(height=h, width=self.NAV_STRIP_MIN if self.nav_scrolls() else w,
+                            scrollregion=(0, 0, w, h))
+
+    def nav_strip_moved(self, first, last):
+        """The strip scrolled or changed size: the scroll bar only shows when it's needed."""
+        self.nav_scrollbar.set(first, last)
+        if self.nav_scrolls() and (float(first) > 0 or float(last) < 1):
+            self.nav_scrollbar.grid(row=2, column=1, sticky="ew", padx=0, pady=(2, 0))
+        else:
+            self.nav_scrollbar.grid_remove()
+
+    def scroll_nav(self, event):
+        """The mouse wheel over the page buttons scrolls them sideways (retro top bar)."""
+        if self.nav_scrolls():
+            step = -1 if (event.num == 4 or getattr(event, "delta", 0) > 0) else 1
+            self.nav_strip.xview_scroll(step * 3, "units")
 
     # ---- text size, finish sound, page shortcuts ----
+    def text_base(self):
+        """The text size in points: the Text size setting (a point smaller in retro)."""
+        smaller = 2 if self.old_win else 1 if self.classic else 0  # (Win 95's was small)
+        return TEXT_SIZES.get(self.text_size.get(), FONT_SIZE) - smaller
+
     def apply_text_size(self):
         """Make all the text Small, Normal or Large (straight away, no restart)."""
-        base = TEXT_SIZES.get(self.text_size.get(), FONT_SIZE)
+        base = self.text_base()
         for name in NAMED_FONTS:
             try:
                 tkfont.nametofont(name).configure(size=base)
             except tk.TclError:
                 pass
-        for font, extra in ((self.font_title, 5), (self.font_brand, 1), (self.font_section, 1),
-                            (self.font_caption, -1), (self.font_nav, 0)):
+        title = 3 if self.classic else 5  # (retro's page titles are smaller too)
+        for font, extra in ((self.font_title, title), (self.font_brand, 1),
+                            (self.font_section, 1), (self.font_caption, -1), (self.font_nav, 0)):
             font.configure(size=base + extra)
         self.size_logo()
         if self.badge is not None:
@@ -6585,6 +8338,45 @@ class AutoClicker:
         if not self.menu_is_vertical() and not self.mini_shown:
             self.set_bar_height(self.bar_height)  # (a wider bar: the window keeps room for it)
         self.refresh_running()
+
+    def shuffle_filter(self):
+        """Super Secret Settings: put a random filter over the app's colours (a different
+        one each time) and play a random sound."""
+        names = [n for n in SCREEN_FILTERS if n != getattr(self, "filter_name", None)]
+        self.filter_name = random.choice(names)
+        _screen_filter[0] = SCREEN_FILTERS[self.filter_name]
+        self.animate_theme()
+        self.status.config(text=f"Filter: {self.filter_name}")
+        self.play_random_sound()
+
+    def filter_off(self, quiet=False):
+        """Super Secret Settings: back to the normal colours."""
+        if _screen_filter[0] is None:
+            return
+        _screen_filter[0] = None
+        self.filter_name = None
+        self.animate_theme()
+        if not quiet:
+            self.status.config(text="Filter off")
+
+    def play_random_sound(self):
+        """One of the system's sounds, picked at random (for Super Secret Settings)."""
+        folder = Path("/usr/share/sounds/freedesktop/stereo")
+        try:
+            sounds = sorted(folder.glob("*.oga"))
+        except OSError:
+            sounds = []
+        if sounds:
+            sound = str(random.choice(sounds))
+            for command in (["pw-play", sound], ["paplay", sound]):
+                if shutil.which(command[0]):
+                    try:
+                        subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL, start_new_session=True)
+                        return
+                    except OSError:
+                        pass
+        self.root.bell()
 
     def play_finish_sound(self):
         """A short "done" sound when a run finishes by itself (not when you stop it)."""
@@ -6628,10 +8420,12 @@ class AutoClicker:
         if self.menu_is_vertical():
             room = self.sidebar.winfo_height() * MENU_FILL - self.logo.winfo_reqheight() - 14
             spare = 2 * Card.INSET_Y + (len(self.nav_buttons) - 1) * 1 + len(self.nav_buttons) * 2
-            height = int(max(34, min(90, (room - spare) / len(self.nav_buttons))))
+            low, high = (24, 30) if self.classic else (34, 90)
+            height = int(max(low, min(high, (room - spare) / len(self.nav_buttons))))
         else:
             # the bar's padding (8 above and below) and the card's own edges
-            height = int(max(34, min(90, self.bar_height - 16 - 2 * Card.INSET_Y)))
+            height = 24 if self.classic else int(
+                max(34, min(90, self.bar_height - 16 - 2 * Card.INSET_Y)))
         changed = False
         for btn in self.nav_buttons.values():
             if int(btn.cget("height")) != height:
@@ -6643,7 +8437,11 @@ class AutoClicker:
     def size_logo(self):
         """The logo grows and shrinks with the menu: with a side menu's width, or a
         top/bottom menu's height (its name too, starting from the text size setting)."""
-        base = TEXT_SIZES.get(self.text_size.get(), FONT_SIZE) + 1
+        base = self.text_base() + 1
+        if self.classic:  # just the words, at the normal size (or Win 95's title bar)
+            self.font_brand.configure(size=base)
+            self.logo.set_text_only(True, title_bar=bool(self.old_win))
+            return
 
         def size(scale):  # (icon, name size) at this scale
             return round(Logo.ICON * scale / 2) * 2, max(7, round(base * scale))
@@ -6671,7 +8469,8 @@ class AutoClicker:
         self.status.configure(wraplength=width - 40)  # text wraps to fit the sidebar
         self.esc_hint.configure(wraplength=width - 24)
         # keep room for the page: if the window is too narrow, it grows to fit
-        self.root.minsize(width + SidebarHandle.WIDTH + PAGE_MIN_WIDTH, MIN_SIZE[1])
+        self.root.minsize(max(self.min_size()[0], width + SidebarHandle.WIDTH
+                              + self.page_min_width()), self.min_size()[1])
 
     def set_bar_height(self, height):
         """How tall a top/bottom menu is (the page buttons grow with it)."""
@@ -6690,8 +8489,27 @@ class AutoClicker:
         if self.menu_is_vertical() or self.mini_shown or not hasattr(self, "sidebar_index"):
             return
         self.sidebar.update_idletasks()
-        self.root.minsize(max(PAGE_MIN_WIDTH, self.sidebar.winfo_reqwidth()),
-                          MIN_SIZE[1] + BAR_EXTRA_HEIGHT + self.bar_height - BAR_MIN)
+        if self.classic:  # (its buttons scroll, see fit_nav_strip)
+            self.root.minsize(max(self.min_size()[0],
+                                  self.retro_bar_room() + self.NAV_STRIP_MIN),
+                              self.min_size()[1] + 40)
+            return
+        self.root.minsize(max(self.page_min_width(), self.sidebar.winfo_reqwidth()),
+                          self.min_size()[1] + BAR_EXTRA_HEIGHT + self.bar_height - BAR_MIN)
+
+    def min_size(self):
+        """The smallest the window can be: much smaller in retro mode."""
+        if self.old_win:  # (and room for its title bar and border)
+            b = 2 * Win95TitleBar.BORDER
+            return RETRO_MIN[0] + b, RETRO_MIN[1] + b + Win95TitleBar.HEIGHT + 2
+        if self.win11_on:
+            b = 2 * Win95TitleBar.BORDER
+            return MIN_SIZE[0] + b, MIN_SIZE[1] + b + 32
+        return RETRO_MIN if self.classic else MIN_SIZE
+
+    def page_min_width(self):
+        """The room the window always keeps for the page."""
+        return RETRO_PAGE_MIN if self.classic else PAGE_MIN_WIDTH
 
     def drag_sidebar(self, x_root, y_root):
         """The line between the menu and the page is being dragged to here."""
@@ -6857,6 +8675,10 @@ class AutoClicker:
         if s.get("area") and self.clicks:
             count = s["area"].count
             parts.append(f"spot {(self.clicks - 1) % count + 1:,} of {count:,}")
+        if self.resting_until is not None:
+            parts.append(f"resting {clock(max(0.0, self.resting_until - time.monotonic()))}")
+        elif self.waiting_for == "colour":
+            parts.append("waiting for the colour")
         if s.get("mode") == "replay" and s.get("plays", 0) > 1:
             parts.append(f"play {min(self.plays_done + 1, s['plays'])} of {s['plays']}")
         return " · ".join(parts)
@@ -6912,6 +8734,8 @@ class AutoClicker:
         self.palette = p
         s = self.style
         self.root.configure(bg=p["bg"])
+        if hasattr(self, "nav_strip"):
+            self.nav_strip.configure(bg=p["bg"])
 
         s.configure(".", background=p["bg"], foreground=p["fg"], fieldbackground=p["field"],
                     bordercolor=p["border"], lightcolor=p["border"], darkcolor=p["border"],
@@ -6943,15 +8767,41 @@ class AutoClicker:
         if getattr(self, "badge", None) is not None:
             self.refresh_running()
 
+    def wanted_palette(self):
+        """The colours to use: light/dark mode + accent colour (or the classic look)."""
+        if self.old_win == "95":
+            p = win95_palette()
+        elif self.old_win == "1":
+            p = win1_palette()
+        elif self.win11_on:
+            accent = self.accent.get()
+            p = win11_palette(bool(self.dark.get()),
+                              accent if is_hex_color(accent) else DEFAULTS["accent"])
+        elif self.classic:
+            p = classic_palette()
+        else:
+            accent = self.accent.get()
+            if not is_hex_color(accent):
+                accent = DEFAULTS["accent"]
+            p = build_palette(bool(self.dark.get()), accent)
+        if _screen_filter[0] is not None:  # (Super Secret Settings)
+            accent = p["accent"]
+            p = filter_palette(p)
+            p["accent_before_filter"] = accent  # (for the logo, which filters its own parts)
+        return p
+
     def animate_theme(self):
         """Fade from the current colours to the new light/dark + accent palette."""
-        accent = self.accent.get()
-        if not is_hex_color(accent):
-            accent = DEFAULTS["accent"]
-        target = build_palette(bool(self.dark.get()), accent)
+        target = self.wanted_palette()
         if self.theme_job is not None:
             self.root.after_cancel(self.theme_job)
             self.theme_job = None
+        if self.classic:  # (no fading in the classic look: it never changes anyway)
+            for frame in self.pages.values():
+                frame.grid()
+            self.pages[self.page.get()].tkraise()
+            self.apply_palette(target)
+            return
         start = dict(self.palette)
         began = time.monotonic()
         hidden = self.hidden_parts()  # (redrawing these every frame made it judder)
@@ -6970,7 +8820,8 @@ class AutoClicker:
             # same grey halfway and the words would vanish. It swaps at the halfway point
             # instead, where the background is mid-grey and either text colour reads fine.
             self.apply_palette({
-                k: (target[k] if eased >= 0.5 else start[k]) if k in TEXT_COLORS
+                k: (target[k] if eased >= 0.5 else start.get(k, target[k]))
+                if k in TEXT_COLORS or k == "accent_before_filter"
                 else mix_color(start[k], target[k], eased)
                 for k in target}, skip=hidden if t < 1 else ())  # the end: everything
             if t < 1:  # the next frame: the time this one took counts towards the wait
@@ -7076,6 +8927,9 @@ class AutoClicker:
             values = {name: var.get() for name, var in self.profile_vars.items()}
             values.update({
                 "locations": self.locations or None,
+                "trigger_box": self.trigger_box,
+                "trigger_color": self.trigger_color,
+                "stats": dict(self.stats),
                 "area": list(self.area),
                 "macro": list(self.macro),
                 "recording": self.recording,
@@ -7099,18 +8953,171 @@ class AutoClicker:
                 "bar_height": self.bar_height,
                 "dark_mode": bool(self.dark.get()),
                 "accent": self.accent.get(),
+                "super_secret_options": self.secret,
+                "retro_mode": self.classic and not self.old_win,
+                "win95_mode": self.old_win == "95",
+                "win1_mode": self.old_win == "1",
+                "win11_mode": self.win11_on,
             })
-            for name in ("limit", "kb_limit", "macro_limit"):
+            for name in ("limit", "kb_limit", "macro_limit", "burst_clicks"):
                 values[name] = max(1, int(values[name]))
             return values
         except (tk.TclError, ValueError):
             return None
 
     def save_settings(self):
+        self.check_settings_file()  # (so a switch typed into the file isn't lost)
         current = self.collect_settings()
         if current is not None:
             current.pop("recording")  # recordings live in their own files
             write_settings(current)
+            try:
+                self.settings_seen = SETTINGS_PATH.stat().st_mtime_ns
+            except OSError:
+                pass
+
+    def check_settings_file(self):
+        """The hidden "super_secret_options" switch is only in settings.json: if the file
+        has been changed (by hand) since the app last wrote it, pick it up from there (and
+        Retro mode, in case that was changed by hand too)."""
+        try:
+            changed = SETTINGS_PATH.stat().st_mtime_ns
+        except OSError:
+            return
+        if changed == self.settings_seen:
+            return
+        first = self.settings_seen is None
+        self.settings_seen = changed
+        if first:
+            return  # (just starting: it was read with the other settings)
+        try:
+            saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            secret, retro = saved.get("super_secret_options"), saved.get("retro_mode")
+        except (OSError, ValueError, AttributeError):
+            return  # (half written, or not a settings file: try again next time)
+        if isinstance(secret, (bool, int)) and bool(secret) != self.secret:
+            self.secret = bool(secret)
+            if not self.secret:
+                self.filter_off(quiet=True)
+            self.show_optional_rows()  # (shows or hides the Super secret options)
+            if self.secret:
+                self.status.config(text="Psst... look in Settings")
+        switches = {"win95": self.win95, "win1": self.win1, "win11": self.win11,
+                    "retro": self.retro}
+        wanted = next((name for name in ("win95", "win1", "win11", "retro")
+                       if saved.get(name + "_mode") in (True, 1)), None)
+        now = (("win" + self.old_win) if self.old_win else "win11" if self.win11_on
+               else "retro" if self.classic else None)
+        if wanted != now:  # (one look at a time: switching one on turns the rest off)
+            if wanted:
+                switches[wanted].set(True)
+            else:
+                switches[now].set(False)
+
+    LOOK_NAMES = {"95": "Win 95 mode", "1": "Win 1 mode", "11": "Win 11 mode"}
+
+    def own_frame(self):
+        """The window has its own title bar and border (see Win95TitleBar)."""
+        return bool(self.old_win) or self.win11_on
+
+    def look_changed(self, switch):
+        """Retro mode, Win 95 mode or Win 1 mode was switched: only one can be on."""
+        if self.switching_look:
+            return
+        self.switching_look = True
+        try:
+            if switch.get():
+                for other in (self.retro, self.win95, self.win1, self.win11):
+                    if other is not switch and other.get():
+                        other.set(False)
+        finally:
+            self.switching_look = False
+        old = "95" if self.win95.get() else "1" if self.win1.get() else None
+        self.set_classic(bool(old) or bool(self.retro.get()), old, bool(self.win11.get()))
+
+    def set_classic(self, on, old=None, win11=False):
+        """Switch between the normal look, the retro one (the very first version's), the
+        old Windows ones: Win 95 mode (old = "95") and Win 1 mode (old = "1"), and Win 11
+        mode (the normal look, as on Windows 11)."""
+        if (on, old, win11) == (self.classic, self.old_win, self.win11_on):
+            return
+        was_on, was_old = self.classic, self.old_win or ("11" if self.win11_on else None)
+        self.win11_on = win11
+        _win11[0] = win11
+        self.classic = on
+        _classic[0] = on
+        if bool(old) != bool(self.old_win):  # (old Windows had no smooth text)
+            set_text_smoothing(not old)
+        self.old_win = old
+        _old_windows[0] = old
+        self.apply_font_family()
+        if not self.own_frame() and not self.mini_shown:  # (back to the computer's title
+            self.win95_frame.show(False)                   # bar; mini mode sorts it out)
+        if not self.mini_shown and on != was_on:  # retro is smaller, like the first window
+            if on:
+                self.size_before_retro = self.root.geometry().split("+")[0]
+                self.root.geometry(RETRO_SIZE)
+            else:
+                self.root.geometry(getattr(self, "size_before_retro", None) or WINDOW_SIZE)
+        self.root.title("Auto Clicker" if on and not old else "Pengclick")
+        if on:
+            self.status_dot.grid_remove()
+        else:
+            self.status_dot.grid()
+        self.handle.plain = on
+        self.logo.set_text_only(on, title_bar=bool(old))
+        self.size_logo()
+        self.apply_text_size()     # (a little smaller in retro)
+        self.compact_widgets()
+        if not self.mini_shown:    # (how small the window can be, and the menu's layout)
+            self.layout_sidebar()
+            if on and not was_on:  # (again, now the window is allowed to be that small)
+                self.root.geometry(RETRO_SIZE)
+                # (and once more in a moment: dropping the title bar for Win 95 mode, the
+                # window manager can change the size while it does)
+                self.root.after(150, lambda: self.classic and not self.mini_shown
+                                and self.root.geometry(RETRO_SIZE))
+        self.show_optional_rows()  # (the accent colour and dark mode rows)
+        self.animate_theme()
+        for widget in self.round_widgets:  # (retro to Win 95: the colours may not change,
+            if hasattr(widget, "redraw"):  # but the edges do)
+                widget.redraw()
+        now = old or ("11" if win11 else None)
+        self.status.config(text=self.LOOK_NAMES[now] + " on" if now
+                           else "Retro mode on" if on
+                           else self.LOOK_NAMES[was_old] + " off" if was_old
+                           else "Retro mode off")
+        self.save_settings()
+
+    def compact_widgets(self):
+        """Retro mode is compact, like the first version: shorter boxes and buttons, and
+        less room around rows and the page. (Each widget remembers its normal height, see
+        register.)"""
+        nav = set(self.nav_buttons.values())  # (sized by size_nav_buttons)
+        for widget in self.round_widgets:
+            base = getattr(widget, "base_height", None)
+            if base and widget not in nav:
+                widget.configure(height=retro_height(base) if self.classic else base)
+        if self.menu_is_vertical():  # (short in retro, so the menu can be narrow)
+            self.mini_switch.set_text("Mini" if self.classic else "Mini mode")
+        for button in nav:  # (narrower, so the window can be small)
+            button.configure(width=60 if self.classic else 92)
+        for widget in self.round_widgets:  # a switch with words: a tick box is narrower
+            if isinstance(widget, ToggleSwitch) and widget.text:
+                widget.configure(width=widget.base_width - (ToggleSwitch.TRACK_W - 13)
+                                 if self.classic else widget.base_width)
+        self.content.configure(padding=10 if self.classic else 20)
+        for card, _heading in self.cards:
+            for row, _divider, _show in card.rows:
+                words = row.parts["title"].master
+                words.grid_configure(pady=2 if self.classic else 7)
+                box = row.parts["box"]
+                if box is not None:
+                    hidden = not box.winfo_manager()  # (changing it would show it again)
+                    box.grid_configure(pady=2 if self.classic else 6)
+                    if hidden:
+                        box.grid_remove()
+        self.size_nav_buttons()
 
     def save_current_recording(self):
         """Only called when the recording changes, so saving settings stays instant."""
@@ -7777,6 +9784,17 @@ class AutoClicker:
                     "area_box": shapes_box(self.area) if self.area else None,
                     "area_return": bool(self.area_return.get()),
                     "unit": ("click", "clicks"),
+                    # (clicks, seconds of rest) or None, see click_loop
+                    "burst": ((max(1, int(self.burst_clicks.get())),
+                               min(max(0.0, float(self.burst_rest.get())), 3600.0))
+                              if self.burst_on.get() and not hold else None),
+                    # (box, (r, g, b), tolerance, click while it's there) or None
+                    "trigger": ((list(self.trigger_box),
+                                 tuple(int(self.trigger_color[i:i + 2], 16) for i in (1, 3, 5)),
+                                 min(max(0, int(self.trigger_tolerance.get())), 255),
+                                 self.trigger_when.get() != "Not in the box")
+                                if self.trigger_on.get() and not hold and self.trigger_box
+                                and self.trigger_color else None),
                 }
             # replays move the mouse themselves, so auto stop would stop them straight away
             self.settings["auto_stop"] = bool(self.auto_stop.get()) and mode != "replay"
@@ -7786,6 +9804,10 @@ class AutoClicker:
         if (mode == "mouse" and self.area_on.get() and not self.settings["hold"]
                 and not self.settings.get("area")):
             self.status.config(text="Add a shape on the Areas page first")
+            return False
+        if (mode == "mouse" and not self.settings["hold"] and self.trigger_on.get()
+                and not (self.trigger_box and self.trigger_color)):
+            self.status.config(text="Pick a box and a colour for the colour trigger first")
             return False
         if mode == "mouse" and self.location_on.get() and not self.locations:
             self.status.config(
@@ -8281,6 +10303,12 @@ class AutoClicker:
         self.home_pos = None  # where "Put the mouse back" returns it to, see tap
         self.note_own_windows()
         self.started_at = time.monotonic()
+        self.run_started, self.run_done = time.monotonic(), 0
+        self.waiting_for = self.resting_until = None
+        if self.settings.get("trigger"):  # (its own thread looks at the screen)
+            self.trigger_ok = False
+            threading.Thread(target=self.watch_colour, args=(self.settings,),
+                             daemon=True).start()
         self.running.set()
         self.refresh_running()
 
@@ -8291,6 +10319,32 @@ class AutoClicker:
         self.release_held()
         self.refresh_button()
         self.status.config(text=message)
+        self.waiting_for = self.resting_until = None
+        if self.run_started is not None:
+            self.count_run()
+            self.save_settings()
+
+    def watch_colour(self, s):
+        """(Its own thread, while a run with the colour trigger goes) Look at the box about
+        20 times a second, and say whether the clicker may click (see click_loop)."""
+        box, target, tolerance, wanted = s["trigger"]
+        x1, y1, x2, y2 = box
+        w, h = max(1, x2 - x1), max(1, y2 - y1)
+        step = max(1, (w * h) // 20000)  # (a big box: look at every so many pixels)
+        try:
+            from Xlib import display as xdisplay
+            d = xdisplay.Display()
+        except Exception:
+            self.trigger_ok = True  # (can't look: just click)
+            return
+        try:
+            while self.armed and self.settings is s and not self.shutdown.is_set():
+                data = grab_screen(x1, y1, w, h, display=d)
+                self.trigger_ok = (data is not None
+                                   and colour_in(data, target, tolerance, step) == wanted)
+                self.stopped.wait(0.05)
+        finally:
+            d.close()
 
     # ---------------- Worker thread ----------------
     def mark_synthetic(self, codes):
@@ -8437,6 +10491,7 @@ class AutoClicker:
                     self.mark_synthetic({action[2]})
                     self.held_codes.add(action[2])
                     self.mouse.press(button)
+                    self.run_done += 1  # (stats)
                     self.held.append(("mouse", button))
                 else:
                     self.mouse.release(button)
@@ -8449,6 +10504,7 @@ class AutoClicker:
                     self.mark_synthetic({action[2]})
                     self.held_codes.add(action[2])  # so key repeat while held is ignored
                     self.keyboard.press(key)
+                    self.run_done += 1  # (stats)
                     self.held.append(("keyboard", key))
                 else:
                     self.keyboard.release(key)
@@ -8485,6 +10541,17 @@ class AutoClicker:
                 self.release_held()
                 continue
 
+            if s.get("trigger") and not self.trigger_ok:  # waiting for the colour
+                if self.waiting_for != "colour":
+                    self.waiting_for = "colour"
+                    self.events.put(("waiting", "colour"))
+                due = None
+                self.stopped.wait(0.02)
+                continue
+            if self.waiting_for == "colour":
+                self.waiting_for = None
+                self.events.put(("waiting", None))
+
             # Clicks keep to a timetable: each one is due `interval` after the one before,
             # however long the clicking itself took, so the speed is what you set (waiting
             # the whole interval after each click would always run a little slow)
@@ -8493,11 +10560,26 @@ class AutoClicker:
                 due = now  # starting, or the computer was busy for a while: don't rush
             self.tap(s)
             self.clicks += 1
+            self.run_done += 1 if s["mode"] in ("keyboard", "macro") or s.get("area") \
+                else s["count"]  # (stats: a double click is 2 clicks)
 
             limit = s["limit"]
             if limit and self.clicks >= limit:
                 self.running.clear()
                 self.events.put("limit")
+                continue
+
+            burst = s.get("burst")
+            if burst and self.clicks % burst[0] == 0 and burst[1] > 0:  # a rest
+                self.resting_until = time.monotonic() + burst[1]
+                self.waiting_for = "rest"
+                self.events.put(("waiting", "rest"))
+                self.stopped.wait(burst[1])  # (returns early if stopped)
+                self.resting_until = None
+                self.waiting_for = None
+                if self.running.is_set():
+                    self.events.put(("waiting", None))
+                due = None
                 continue
 
             due += s["interval"]
@@ -8652,6 +10734,12 @@ class AutoClicker:
                 elif event == "moved":
                     if self.running.is_set():
                         self.stop("Stopped (mouse moved)")
+                elif event[0] == "waiting":  # the colour trigger, or a burst's rest
+                    if self.running.is_set():
+                        self.status.config(text={"colour": "Waiting for the colour...",
+                                                 "rest": "Resting..."}.get(event[1],
+                                                                           "Clicking..."))
+                        self.refresh_running()
                 elif event[0] == "replay_done":
                     played = event[1]
                     self.stop("Replay finished" if played == 1 else f"Done: played {played} times")
@@ -8676,6 +10764,10 @@ class AutoClicker:
                 and time.monotonic() - self.last_badge_update >= 0.25):
             self.last_badge_update = time.monotonic()
             self.refresh_running()
+        if self.run_started is not None and time.monotonic() - getattr(
+                self, "stats_shown", 0) >= 1:
+            self.stats_shown = time.monotonic()
+            self.refresh_stats()
         # Stop after a set time
         limit = self.settings.get("time_limit")
         if self.running.is_set() and limit and time.monotonic() - self.started_at >= limit:
@@ -8684,6 +10776,9 @@ class AutoClicker:
         if self.running.is_set() and (self.settings.get("area")
                                       or self.settings.get("mode") == "macro"):
             self.note_own_windows()
+        if time.monotonic() - self.last_file_check >= 1:
+            self.last_file_check = time.monotonic()
+            self.check_settings_file()
         self.poll_job = self.root.after(50, self.poll)
 
     def on_close(self):

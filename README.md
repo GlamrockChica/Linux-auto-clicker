@@ -8,6 +8,11 @@ and can record and replay what you do.
 - **Mouse clicker:** clicks per second (or a set wait between clicks), left/right/middle
   button, single/double/triple clicks, hold the button down, click at a set spot or at
   several spots in turn
+  - **Bursts:** click a set number of times, rest for a set time, then go again (good for
+    games with cooldowns)
+  - **Colour trigger:** draw a box on the screen and pick a colour, and it only clicks
+    while that colour is in the box (or only while it isn't), like clicking only while a
+    button is green. Choose how close a shade has to be to count
 - **Areas:** draw rectangles, circles, triangles and polygons on the screen (as many as you
   like) and it clicks every spot inside them, a set number of pixels apart, row by row.
   The mouse jumps to each spot and straight back, so you can keep using it. The screen
@@ -37,6 +42,8 @@ and can record and replay what you do.
   drag bigger or smaller (the logo grows with it)
 - A penguin icon holding your own mouse pointer (it's read from your cursor theme when you
   install)
+- **Stats** (at the bottom of Settings): how many clicks and key presses it's done, how
+  many times it's been started, how long it's spent clicking, and what the last run did
 - Tells you when a new version is out on GitHub
 
 ## Requirements
